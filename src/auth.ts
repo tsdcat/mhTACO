@@ -5,7 +5,7 @@
 //      열린다. guest 는 프로필 편집·세션방 PL 참여만 가능(호스팅 용량 보호용 안전장치).
 //   ② 방 역할 GM/PL(rooms.ts, 생성자=소유자=GM)은 ①과 별개로 방 안에서만 의미를 가진다.
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { collectAssetRefs as scanAssetRefs } from './assets'
 import type { PresenceStatus, ProfileLink, ProfileTheme } from './protocol'
@@ -92,6 +92,8 @@ export interface UserSummary {
   username: string
   nickname?: string
   avatar?: string
+  /** 로비 비공개 계정 — 목록에 자물쇠를 그리기 위한 표시(공개 계정이면 생략). */
+  lobbyPrivate?: boolean
 }
 
 /** 관리자 서버관리용 계정 요약(등급·가입일·마지막 접속 포함 — admin 전용). */
@@ -584,6 +586,11 @@ export interface Account {
   friendReqIn?: string[]
   /** 내가 보낸 친구 신청(상대 userId). */
   friendReqOut?: string[]
+  /**
+   * 로비 비공개 — 켜면 친구(와 서버 관리자)만 이 계정의 로비·블로그·세션 로그·방명록·마이룸을 볼 수 있다.
+   * 미설정=공개. 친구를 끊으면 friends 에서 빠지는 순간 바로 닫히므로 별도 회수 절차가 없다.
+   */
+  lobbyPrivate?: boolean
   /** 수동 프레즌스 상태(미설정=online). invisible 은 재접속 후에도 유지.
    *  PublicAccount 에는 절대 싣지 않는다 — /home 등으로 새면 '오프라인 표시' 위장이 무력화된다. */
   status?: PresenceStatus
@@ -602,6 +609,8 @@ export interface PublicAccount {
   banner?: string
   links?: ProfileLink[]
   profileTheme?: ProfileTheme
+  /** 로비 비공개 여부 — 방문 화면이 자물쇠와 안내를 그리는 데 쓴다(숨길 값이 아니다). */
+  lobbyPrivate?: boolean
 }
 
 /** 프로필 편집 패치(부분 갱신). */
@@ -612,6 +621,7 @@ export interface ProfilePatch {
   banner?: string
   links?: ProfileLink[]
   profileTheme?: ProfileTheme
+  lobbyPrivate?: boolean
 }
 
 export type AuthResult =
@@ -619,7 +629,9 @@ export type AuthResult =
   | { ok: false; error: string }
 
 export type ProfileResult = { ok: true; account: PublicAccount } | { ok: false; error: string }
-export type GuestbookResult = { ok: true; guestbook: GuestbookEntry[] } | { ok: false; error: string }
+/** 방명록 조작 결과. guestbook 이 빠져 오면 '바뀐 것 없음'이라는 뜻이다 — 이미 지워진 글을 다시
+ *  지우라는 요청이 그렇다. 없는 글 번호로 남의 방명록을 읽어 가지 못하게, 그때는 목록을 싣지 않는다. */
+export type GuestbookResult = { ok: true; guestbook?: GuestbookEntry[] } | { ok: false; error: string }
 export type LobbyResult = { ok: true } | { ok: false; error: string }
 
 /** 친구 신청/수락/거절/끊기 결과. 성공 시 상대 id(targetId)·행위자 id(selfId, 본인 다른 기기 푸시용)·자동수락 여부. */
@@ -736,6 +748,13 @@ export interface AuthStore {
   setStatus(accountId: string, status: PresenceStatus): boolean
   /** 저장된 수동 프레즌스 상태(미설정=undefined=online). */
   getStatus(accountId: string): PresenceStatus | undefined
+  /**
+   * 이 사람의 로비(와 그 안의 블로그·세션 로그·방명록)를 볼 수 있는가.
+   *
+   * 공개 계정이면 누구나, 비공개 계정이면 본인·친구·서버 관리자만 통과한다. viewerId 가 null 이면
+   * 로그인하지 않은 열람자다. 판정 재료가 계정 레코드뿐이라 친구를 끊는 즉시 다음 요청부터 닫힌다.
+   */
+  canViewLobby(viewerId: string | null, ownerId: string): boolean
   /** 갠홈 둘러보기 — 전체 사용자 공개 요약(닉네임순). */
   listUsers(): UserSummary[]
   /** 관리자 계정 id 목록 — 새 가입 알림처럼 '서버장에게만' 보내야 하는 곳에서 쓴다. */
@@ -775,6 +794,8 @@ const DEFAULT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** 로그인 레이트리밋 기본값 — 윈도 내 최대 실패 횟수 / 윈도 길이. */
 const DEFAULT_MAX_LOGIN_ATTEMPTS = 8
 const DEFAULT_LOGIN_WINDOW_MS = 5 * 60 * 1000
+/** 계정 하나가 동시에 들고 있을 수 있는 로그인 수(기기 수). 넘으면 오래 안 쓴 것부터 풀린다. */
+const MAX_SESSIONS_PER_ACCOUNT = 10
 
 interface Session {
   accountId: string
@@ -798,6 +819,8 @@ export function createAuthStore(opts?: {
   const dataDir = opts?.dataDir ?? join(process.cwd(), 'data')
   const accountsPath = join(dataDir, 'accounts.json')
   const configPath = join(dataDir, 'config.json')
+  // 로그인 세션 — 계정 파일과 같은 폴더에 둔다(⚠ 토큰 자체가 열쇠라 비밀번호 해시와 보호 범위를 맞춘다).
+  const sessionsPath = join(dataDir, 'sessions.json')
   const ttl = opts?.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
   const maxAttempts = opts?.maxLoginAttempts ?? DEFAULT_MAX_LOGIN_ATTEMPTS
   const windowMs = opts?.loginWindowMs ?? DEFAULT_LOGIN_WINDOW_MS
@@ -805,7 +828,7 @@ export function createAuthStore(opts?: {
 
   let accounts: Account[] = []
   let config: ConfigShape = {}
-  // 토큰 → 세션(계정 id + 만료시각). 인메모리(서버 재시작 시 휘발 = 전원 재로그인).
+  // 토큰 → 세션(계정 id + 만료시각). 파일로도 남긴다 — 아래 로드/저장 참고.
   const sessions = new Map<string, Session>()
   // 로그인 실패 추적(정규화 아이디 기준 슬라이딩 윈도). 브루트포스 완화.
   const loginAttempts = new Map<string, { count: number; resetAt: number }>()
@@ -817,12 +840,36 @@ export function createAuthStore(opts?: {
         if (Array.isArray(data.accounts)) accounts = data.accounts
       }
     } catch (e) {
-      console.error('[auth] accounts.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[auth] accounts.json 로드 실패. 빈 목록으로 시작:', e)
     }
     try {
       if (existsSync(configPath)) config = JSON.parse(readFileSync(configPath, 'utf8')) as ConfigShape
     } catch (e) {
       console.error('[auth] config.json 로드 실패:', e)
+    }
+    // 지난번에 켜져 있던 로그인들을 되살린다(만료된 것은 버린다).
+    try {
+      if (existsSync(sessionsPath)) {
+        const raw = JSON.parse(readFileSync(sessionsPath, 'utf8')) as unknown
+        const t = now()
+        if (Array.isArray(raw)) {
+          for (const e of raw) {
+            if (!Array.isArray(e) || typeof e[0] !== 'string') continue
+            const s = e[1] as Partial<Session> | undefined
+            if (!s || typeof s.accountId !== 'string' || typeof s.expiresAt !== 'number') continue
+            if (s.expiresAt > t) sessions.set(e[0], { accountId: s.accountId, expiresAt: s.expiresAt })
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[auth] sessions.json 로드 실패. 로그인 상태 없이 시작:', e)
+    }
+    // 지난 저장이 이름 바꾸기까지 못 간 임시본이 남아 있으면 지운다 — 토큰 목록이 파일로 굴러다니지 않게.
+    try {
+      const stale = sessionsPath + '.tmp'
+      if (existsSync(stale)) unlinkSync(stale)
+    } catch {
+      /* 잠겨 있으면 다음 저장이 덮어쓴다 */
     }
   }
 
@@ -836,6 +883,40 @@ export function createAuthStore(opts?: {
     } catch (e) {
       console.error('[auth] 계정 저장 실패:', e)
     }
+  }
+
+  /**
+   * 로그인 세션을 파일로 남긴다 — 서버가 다시 켜져도 붙어 있던 사람이 로그인 화면으로 튕기지 않게.
+   *
+   * 토큰이 메모리에만 있으면 서버가 한 번 내려갔다 오는 순간 모두의 토큰이 한꺼번에 무효가 되고, 클라는
+   * 그것을 '인증 필요'로 받아 조용히 로그아웃한다. 그래서 잠깐 끊겼다 붙는 일이 '전원 재로그인'이 된다 —
+   * 사고의 원인이 무엇이든 사람들이 겪는 무게가 여기서 갈린다. 파일로 남겨 두면 '잠깐 끊김'으로 끝난다.
+   */
+  let sessionSaveTimer: NodeJS.Timeout | null = null
+  function saveSessions(): void {
+    if (!persist) return
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer)
+      sessionSaveTimer = null
+    }
+    try {
+      mkdirSync(dataDir, { recursive: true })
+      const tmp = sessionsPath + '.tmp'
+      writeFileSync(tmp, JSON.stringify([...sessions]), 'utf8') // 원자적 쓰기(임시→rename)
+      renameSync(tmp, sessionsPath)
+    } catch (e) {
+      console.error('[auth] 세션 저장 실패:', e)
+    }
+  }
+  // 만료 연장은 요청마다 일어난다 — 그때마다 쓰면 디스크가 이벤트 루프를 잡는다. 몰아서 한 번만 쓴다.
+  // 늦게 써도 손해가 없다: 유효기간이 몇 초 덜 늘어난 채로 남을 뿐이고, 기간은 애초에 날 단위다.
+  function saveSessionsSoon(): void {
+    if (!persist || sessionSaveTimer) return
+    sessionSaveTimer = setTimeout(() => {
+      sessionSaveTimer = null
+      saveSessions()
+    }, 10_000)
+    sessionSaveTimer.unref() // 대기 중 저장이 프로세스 종료(테스트 러너 포함)를 붙잡지 않게
   }
 
   // 마지막 접속 기록 — 메모리는 즉시 갱신, 파일 쓰기는 전역 1회로 뭉친다(60초 트레일링).
@@ -863,13 +944,29 @@ export function createAuthStore(opts?: {
     bio: a.bio,
     banner: a.banner,
     links: a.links,
-    profileTheme: a.profileTheme
+    profileTheme: a.profileTheme,
+    lobbyPrivate: a.lobbyPrivate
   })
   function issue(a: Account): string {
     const token = randomUUID() + randomUUID() // 불투명 토큰
     sessions.set(token, { accountId: a.id, expiresAt: now() + ttl })
     sweepSessions() // 만료 토큰 정리(로그인 빈도 = 드묾 → O(n) 허용)
+    trimSessions(a.id)
+    saveSessions() // 로그인은 드무니 바로 남긴다(직후 서버가 내려가도 다시 로그인하지 않게)
     return token
+  }
+  /**
+   * 한 계정이 들고 있는 로그인 수를 제한한다 — 오래된 것부터 놓아 준다.
+   *
+   * 로그인 때마다 새 열쇠가 하나씩 생기는데 예전에는 서버를 껐다 켜면 전부 사라졌다. 이제는 파일로
+   * 남으므로 유효기간(기본 30일) 동안 계속 쌓인다 — 로그인 한 번이 그때까지 쌓인 목록 전체를 다시
+   * 쓰는 일이 되어, 놔두면 로그인이 점점 무거워지고 안 쓰는 열쇠도 한 달씩 살아 있는다.
+   */
+  function trimSessions(accountId: string): void {
+    const mine = [...sessions].filter(([, s]) => s.accountId === accountId)
+    if (mine.length <= MAX_SESSIONS_PER_ACCOUNT) return
+    mine.sort((x, y) => x[1].expiresAt - y[1].expiresAt) // 만료가 가까운 것 = 오래 안 쓴 것
+    for (const [tok] of mine.slice(0, mine.length - MAX_SESSIONS_PER_ACCOUNT)) sessions.delete(tok)
   }
   /** 만료 세션 일괄 제거(메모리 바운드). */
   function sweepSessions(): void {
@@ -883,9 +980,11 @@ export function createAuthStore(opts?: {
     if (!s) return null
     if (s.expiresAt <= now()) {
       sessions.delete(token)
+      saveSessionsSoon()
       return null
     }
     s.expiresAt = now() + ttl // 슬라이딩 — 활성 세션은 계속 연장
+    saveSessionsSoon()
     return s.accountId
   }
   const find = (username: string): Account | undefined => {
@@ -936,7 +1035,9 @@ export function createAuthStore(opts?: {
   /** id → 공개 요약(없으면 null). 친구 목록 응답용. */
   function summaryOf(id: string): UserSummary | null {
     const a = accounts.find((x) => x.id === id)
-    return a ? { id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar } : null
+    return a
+      ? { id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar, lobbyPrivate: a.lobbyPrivate }
+      : null
   }
 
   return {
@@ -994,6 +1095,7 @@ export function createAuthStore(opts?: {
 
     logout(token) {
       sessions.delete(token)
+      saveSessions() // 로그아웃은 바로 남긴다 — 되살아난 토큰으로 다시 들어가지지 않게
     },
 
     deleteAccount(token, password) {
@@ -1009,6 +1111,7 @@ export function createAuthStore(opts?: {
       }
       accounts = accounts.filter((x) => x.id !== id)
       for (const [tok, s] of sessions) if (s.accountId === id) sessions.delete(tok) // 모든 세션 무효화
+      saveSessions()
       // 다른 사용자 홈에 이 사람이 남긴 방명록 글 제거(작성자 스냅샷이라 별도 정리 필요).
       for (const acc of accounts) {
         if (acc.guestbook?.some((e) => e.authorId === id)) {
@@ -1046,6 +1149,7 @@ export function createAuthStore(opts?: {
       a.hash = hashPassword(pw, a.salt)
       // 지금 쓰는 세션만 남기고 나머지는 끊는다(다른 기기·다른 사람 로그아웃).
       for (const [tok, s] of sessions) if (s.accountId === id && tok !== token) sessions.delete(tok)
+      saveSessions()
       save()
       return { ok: true, accountId: id }
     },
@@ -1144,6 +1248,7 @@ export function createAuthStore(opts?: {
       if (a.role === 'admin') return { ok: false, error: '관리자 계정은 삭제할 수 없습니다.' }
       accounts = accounts.filter((x) => x.id !== userId)
       for (const [tok, s] of sessions) if (s.accountId === userId) sessions.delete(tok) // 세션 무효화
+      saveSessions()
       // 다른 사용자 홈에 이 사람이 남긴 방명록 글 제거(작성자 스냅샷이라 별도 정리 필요).
       for (const acc of accounts) {
         if (acc.guestbook?.some((e) => e.authorId === userId)) {
@@ -1252,6 +1357,8 @@ export function createAuthStore(opts?: {
       if (typeof patch?.banner === 'string') a.banner = patch.banner ? dataImageUrl(patch.banner, 1_200_000) : undefined
       if (Array.isArray(patch?.links)) a.links = sanitizeLinks(patch.links)
       if (patch?.profileTheme !== undefined) a.profileTheme = sanitizeTheme(patch.profileTheme)
+      // 기본값(공개)이면 필드 자체를 지운다 — accounts.json 이 전 계정에 false 를 싣고 다니지 않게.
+      if (typeof patch?.lobbyPrivate === 'boolean') a.lobbyPrivate = patch.lobbyPrivate || undefined
       save()
       return { ok: true, account: pub(a) }
     },
@@ -1276,9 +1383,27 @@ export function createAuthStore(opts?: {
       return accounts.filter((a) => a.role === 'admin').map((a) => a.id)
     },
 
+    canViewLobby(viewerId, ownerId) {
+      const owner = accounts.find((x) => x.id === ownerId)
+      // 없는 사람은 잠글 것도 없다 — 여기서 막으면 탈퇴했거나 오타로 들어간 주소가 '비공개 계정'으로
+      // 안내되어, 그 사람이 있는데 나만 못 보는 것처럼 읽힌다. 통과시키면 뒤에서 제 몫의 '없음'이 나온다.
+      if (!owner) return true
+      if (!owner.lobbyPrivate) return true
+      if (!viewerId) return false
+      if (viewerId === ownerId) return true
+      if ((owner.friends ?? []).includes(viewerId)) return true
+      return accounts.find((x) => x.id === viewerId)?.role === 'admin'
+    },
+
     listUsers() {
       return accounts
-        .map((a) => ({ id: a.id, username: a.username, nickname: a.nickname, avatar: a.avatar }))
+        .map((a) => ({
+          id: a.id,
+          username: a.username,
+          nickname: a.nickname,
+          avatar: a.avatar,
+          lobbyPrivate: a.lobbyPrivate
+        }))
         .sort((x, y) => (x.nickname || x.username).localeCompare(y.nickname || y.username))
     },
 
@@ -1318,7 +1443,11 @@ export function createAuthStore(opts?: {
       if (!target) return { ok: false, error: '대상을 찾을 수 없습니다.' }
       const list = target.guestbook ?? []
       const entry = list.find((e) => e.id === entryId)
-      if (!entry) return { ok: true, guestbook: list } // 이미 없음 — 멱등
+      // 없는 글 번호를 대면 '이미 지워졌다'로 넘어가는 자리다. 예전에는 그러면서 방명록을 통째로
+      // 돌려줬는데, 그것이 곧 읽는 길이었다 — 아무 번호나 대면 남의 방명록이 전부 나왔다.
+      // 두 번 눌러도 오류가 안 나야 하는 것은 그대로 두고, 목록만 싣지 않는다(부르는 쪽은 안 온
+      // 목록을 '변화 없음'으로 읽는다).
+      if (!entry) return { ok: true }
       // 홈 주인(대상=요청자) 또는 작성자만 삭제 가능.
       if (requesterId !== target.id && requesterId !== entry.authorId) {
         return { ok: false, error: '삭제 권한이 없습니다.' }

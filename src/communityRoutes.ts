@@ -324,6 +324,9 @@ const BOARD_ROUTES: Record<string, Route> = {
         const mine = sum.authorId === c.account.id
         if (!mine && !c.can('board.editAny')) return fail('수정할 수 없습니다.', 403)
         if (mine && !c.can('board.edit')) return fail('수정할 수 없습니다.', 403)
+        // 게시판을 바꾸는 길은 /cmty/post/move 하나뿐이다. 여기로 다른 게시판을 보내면 저장은 그 게시판
+        // 양식으로 칸을 걷으면서 글은 제자리에 남아, 화면에 없는 값이 조용히 사라진다.
+        if (sum.boardId !== s(b.boardId, 64)) return fail('글의 게시판이 바뀌었습니다. 화면을 새로 열어 주세요.')
       }
       if (b.visibility === 'secret' && !c.can('board.secret')) return fail('비밀글을 쓸 수 없습니다.', 403)
       // 첨부 권한 검사 — 이번에 '새로' 붙이는 그림만 본다. 이미 올라간 글의 표지를 그대로 되보내는
@@ -423,6 +426,40 @@ const BOARD_ROUTES: Record<string, Route> = {
       if (sum.authorId !== c.account.id && !c.can('board.deleteAny')) return fail('바꿀 수 없습니다.', 403)
       const st = b.status === 'recruit' || b.status === 'running' || b.status === 'closed' ? b.status : 'running'
       return from(d.posts.setStatus(postId, st), 'post')
+    }
+  },
+
+  // 글을 다른 게시판으로 옮긴다(카테고리 변경). 글쓴이 본인이거나 이동 권한이 있는 운영진만.
+  // 옮길 곳에도 읽기·쓰기 권한이 있어야 한다 — 못 읽는 곳으로 빼돌리거나 숨은 게시판에 밀어 넣을 수 없게.
+  '/cmty/post/move': {
+    need: 'board.read',
+    scope: 'postId',
+    rate: 'social',
+    run(b, c, d) {
+      const postId = s(b.postId, 64)
+      const sum = d.posts.summary(postId)
+      if (!sum) return fail('글을 찾을 수 없습니다.', 404)
+      const mine = sum.authorId === c.account.id
+      if (mine ? !c.can('board.edit') : !c.can('board.move')) return fail('옮길 수 없습니다.', 403)
+
+      const dest = d.community.board(s(b.toBoardId, 64))
+      if (!dest) return fail('옮길 게시판을 찾을 수 없습니다.', 404)
+      if (dest.id === sum.boardId) return fail('이미 그 게시판에 있는 글입니다.')
+      if (!c.can('board.read', dest) || !c.can('board.write', dest)) return fail('그 게시판에는 글을 옮길 수 없습니다.', 403)
+      // 종류가 다르면 저장 형태도 다르다 — 캐릭터 게시판의 글을 자유 게시판에 두면 화면이 읽지 못한다.
+      if (c.board && dest.kind !== c.board.kind) return fail('종류가 다른 게시판으로는 옮길 수 없습니다.')
+      // 익명 게시판을 드나들면 쓴 사람이 드러나거나 반대로 가려진다. 어느 쪽이든 본인 뜻과 다르게 바뀐다.
+      if (c.board && dest.anonymous !== c.board.anonymous) return fail('익명 여부가 다른 게시판으로는 옮길 수 없습니다.')
+
+      const fromId = sum.boardId
+      const r = d.posts.move(postId, dest.id, c.now)
+      if (!r.ok) return fail(r.error)
+      c.audit('post.move', `${r.value.title} → ${dest.name}`, { type: 'post', id: postId })
+      // 양쪽 게시판을 보고 있는 사람 모두에게 알린다 — 한쪽만 보내면 옛 목록에 유령 줄이 남는다.
+      d.emitTo('cmtyb:' + fromId, 'cmty:post', { boardId: fromId, op: 'update', postId })
+      d.emitTo('cmtyb:' + dest.id, 'cmty:post', { boardId: dest.id, op: 'new', postId })
+      // 익명 게시판의 글은 나가기 전에 쓴 사람을 지운다 — 목록·상세와 같은 규칙을 여기서도 지킨다.
+      return ok({ post: anonymize(r.value, c, dest) })
     }
   },
 
@@ -983,6 +1020,16 @@ export function createCommunityRoutes(d: CommunityRouteDeps) {
         console.error('[community] 라우트 오류:', req.url, e)
         send(fail('처리에 실패했습니다.', 500))
       }
+    }).catch((e: unknown) => {
+      // 위 try 는 라우트 본체만 감싼다 — 인증·권한 해석처럼 그 앞에서 터진 것을 받는 그물이 여기다.
+      // 놓치면 요청 하나의 예외로 서버가 통째로 내려가 접속자 전원이 끊긴다.
+      console.error('[community] 라우트 오류:', req.url, e)
+      if (res.headersSent) {
+        res.end()
+        return
+      }
+      res.writeHead(500, JSON_H)
+      res.end(JSON.stringify({ ok: false, error: '처리에 실패했습니다.' }))
     })
     return true
   }

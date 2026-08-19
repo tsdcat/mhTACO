@@ -934,7 +934,7 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       }
       auditCache = loadRecentAudit()
     } catch (e) {
-      console.error('[community] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

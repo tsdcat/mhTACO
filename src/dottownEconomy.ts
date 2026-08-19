@@ -264,7 +264,7 @@ export function createEconomyStore(opts?: { dataDir?: string; persist?: boolean;
         if (d.lastFish && typeof d.lastFish === 'object') lastFish = d.lastFish
       }
     } catch (e) {
-      console.error('[dottown-econ] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[dottown-econ] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

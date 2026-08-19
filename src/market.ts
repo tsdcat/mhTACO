@@ -144,7 +144,7 @@ export function createMarketStore(opts?: { dataDir?: string; persist?: boolean }
         if (d.owned && typeof d.owned === 'object') owned = d.owned
       }
     } catch (e) {
-      console.error('[market] dottown-market.json 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[market] dottown-market.json 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

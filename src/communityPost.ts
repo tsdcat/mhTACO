@@ -291,6 +291,11 @@ export interface CommunityPostStore {
   purgeExpired(now: number): number
   setNotice(postId: string, level: NoticeLevel, noticeMax: number): Result<PostSummary>
   setStatus(postId: string, status: ThreadStatus): Result<PostSummary>
+  /**
+   * 글 하나를 다른 게시판으로 옮긴다(카테고리 변경). 옮긴 뒤의 요약을 돌려준다.
+   * 공지는 내려간다 — 게시판마다 공지 자리 수가 따로라, 옮긴 글이 남의 자리를 밀어낼 수 없다.
+   */
+  move(postId: string, toBoardId: string, now: number): Result<PostSummary>
   /** 글쓴이·운영진이 댓글을 닫거나 다시 연다. 달려 있던 댓글은 건드리지 않는다. */
   setCommentsClosed(postId: string, closed: boolean): Result<Post>
   like(postId: string, accountId: string): Result<{ liked: boolean; count: number }>
@@ -344,7 +349,7 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
         if (Array.isArray(d)) reports = d as Report[]
       }
     } catch (e) {
-      console.error('[community/post] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[community/post] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 
@@ -733,6 +738,36 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       doc.post.status = status
       doc.dirty = true
       syncSummary(doc)
+      savePost(postId)
+      return { ok: true, value: toSummary(doc.post) }
+    },
+
+    move(postId, toBoardId, now) {
+      const doc = loadDoc(postId)
+      if (!doc || doc.post.deletedAt) return { ok: false, error: '글을 찾을 수 없습니다.' }
+      const from = doc.post.boardId
+      if (!isEntityId(toBoardId)) return { ok: false, error: '게시판이 올바르지 않습니다.' }
+      if (from === toBoardId) return { ok: false, error: '이미 그 게시판에 있는 글입니다.' }
+      const dest = idx(toBoardId)
+      if (dest.summaries.filter((s) => !s.deletedAt).length >= MAX_POSTS_PER_BOARD) {
+        return { ok: false, error: `한 게시판에 글은 ${MAX_POSTS_PER_BOARD}개까지입니다.` }
+      }
+      // 공지는 게시판마다 자리 수가 따로다 — 옮기면서 남의 자리를 밀어내지 않도록 내려 둔다.
+      doc.post.notice = 0
+      doc.post.boardId = toBoardId
+      doc.post.updatedAt = now
+      doc.dirty = true
+      // 반드시 새 게시판에 먼저 넣고 옛 게시판에서 뺀다. 순서를 뒤집으면 그 사이에 자산 회수가 돌 때
+      // 이 글의 그림이 어느 색인에도 없어 고아로 잡혀 지워진다.
+      syncSummary(doc)
+      const old = boards.get(from)
+      if (old) {
+        const keep = old.summaries.filter((s) => s.id !== postId)
+        if (keep.length !== old.summaries.length) {
+          old.summaries = keep
+          markBoard(from)
+        }
+      }
       savePost(postId)
       return { ok: true, value: toSummary(doc.post) }
     },

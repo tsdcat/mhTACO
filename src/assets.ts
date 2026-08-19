@@ -135,7 +135,7 @@ export function createAssetStore(opts?: { dataDir?: string; persist?: boolean })
         for (const [h, m] of Object.entries(obj)) if (HASH_RE.test(h) && typeof m === 'string') mimes.set(h, safeAssetMime(m))
       }
     } catch (e) {
-      console.error('[assets] index.json 로드 실패 — 빈 색인으로 시작:', e)
+      console.error('[assets] index.json 로드 실패. 빈 색인으로 시작:', e)
     }
   }
 

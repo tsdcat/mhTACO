@@ -258,6 +258,8 @@ export interface PostStore {
   listFor(viewerId: string | null, targetId: string): { posts: PostSummary[]; boards: Board[] }
   /** 글 상세 — 비공개/임시저장은 작성자만. 권한 없으면 null. */
   get(viewerId: string | null, postId: string): { post: PostDetail; liked: boolean } | null
+  /** 이 글의 주인 계정 id — 글 자체를 내주기 전에 로비 열람 권한을 물어보는 데 쓴다. 없는 글이면 null. */
+  ownerOf(postId: string): string | null
   /** 작성/수정(작성자) — id 있고 소유면 수정, 아니면 새 글. */
   save(authorId: string, input: PostInput): PostSaveResult
   /** 글 삭제(작성자). 삭제했으면 true. */
@@ -328,7 +330,7 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
         if (data.boards && typeof data.boards === 'object') boards = data.boards
       }
     } catch (e) {
-      console.error('[posts] posts.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[posts] posts.json 로드 실패. 빈 목록으로 시작:', e)
     }
   }
 
@@ -397,6 +399,10 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       const p = findPost(postId)
       if (!p || !canView(viewerId, p)) return null
       return { post: detail(p), liked: !!viewerId && p.likes.includes(viewerId) }
+    },
+
+    ownerOf(postId) {
+      return findPost(postId)?.authorId ?? null
     },
 
     save(authorId, input) {
