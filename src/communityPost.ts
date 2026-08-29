@@ -21,6 +21,10 @@ const MAX_TAGS = 12
 const MAX_TAG = 30
 const MAX_CAST = 20
 const MAX_GALLERY = 60
+/** 링크 칸 하나에 담을 수 있는 주소 수와 각 칸의 길이. 프로필 링크와 같은 한도로 맞춘다. */
+const MAX_LINKS = 8
+const MAX_LINK_LABEL = 30
+const MAX_LINK_URL = 400
 const MAX_COMMENTS = 300
 const MAX_COMMENT = 2000
 const MAX_COMMENT_IMAGES = 4
@@ -34,6 +38,12 @@ const MAX_REPORT_DETAIL = 500
 const BODY_CACHE_MAX = 200
 /** 삭제 글 보관 기간. 이 안에는 되살릴 수 있다. */
 const TRASH_KEEP_MS = 30 * 24 * 60 * 60 * 1000
+
+/** 링크 칸의 한 줄 — 보일 이름과 주소. 화면은 이 짝을 그대로 <a> 로 그린다. */
+export interface FieldLink {
+  label: string
+  url: string
+}
 
 export type Visibility = 'all' | 'member' | 'secret'
 export type NoticeLevel = 0 | 1 | 2
@@ -166,6 +176,10 @@ export interface SaveInput {
   charName?: unknown
   /** 게시판 양식에서 '본문(서식)' 으로 선언된 칸 이름들. 그 칸 값만 새니타이저를 통과시킨다. */
   richFieldKeys?: unknown
+  /** 게시판 양식에서 '링크' 로 선언된 칸 이름들. 그 칸 값만 주소 짝의 목록으로 받는다. */
+  linkFieldKeys?: unknown
+  /** 게시판 양식의 첫 '태그' 칸 이름. 그 칸은 글의 태그 목록(tags)이 맡으므로 fields 에 남기지 않는다. */
+  tagsKey?: unknown
   /** 게시판 양식이 지금 쓰는 칸 이름 전부. 양식에서 사라진 칸의 값을 걷는 데 쓴다. */
   formKeys?: unknown
 }
@@ -216,6 +230,11 @@ function strList(v: unknown, maxLen: number, maxItems: number): string[] {
   }
   return out
 }
+/** 태그 칸에 남아 있던 값 — 이 칸이 글의 태그를 맡기 전에는 쉼표로 이은 한 줄로 담겼다. */
+function tagCell(v: unknown): unknown[] {
+  if (Array.isArray(v)) return v
+  return typeof v === 'string' ? v.split(',') : []
+}
 function assetList(v: unknown, maxItems: number): string[] {
   if (!Array.isArray(v)) return []
   const out: string[] = []
@@ -240,6 +259,29 @@ function normBgm(v: unknown): PostBgm | null {
     return YT_ID_RE.test(src) ? { kind: 'yt', src, loop, volume } : null
   }
   return null
+}
+/**
+ * 링크 칸 값 정규화. 주소는 http(s) 만 받는다 — 이 값은 화면에서 <a href> 로 그려지므로
+ * javascript: 같은 스킴이 그대로 들어가면 누르는 사람이 위험해진다.
+ */
+function normLinks(v: unknown): FieldLink[] {
+  if (!Array.isArray(v)) return []
+  const out: FieldLink[] = []
+  for (const raw of v) {
+    if (!raw || typeof raw !== 'object') continue
+    const o = raw as Record<string, unknown>
+    let url = line(o.url, MAX_LINK_URL)
+    if (!url) continue
+    if (!/^https?:\/\//i.test(url)) {
+      // 스킴을 안 적은 주소는 https 로 본다. 그 밖의 스킴은 아예 버린다.
+      if (/^[\w.-]+\.[a-z]{2,}/i.test(url)) url = 'https://' + url
+      else continue
+    }
+    const label = line(o.label, MAX_LINK_LABEL)
+    out.push({ label: label || url, url })
+    if (out.length >= MAX_LINKS) break
+  }
+  return out
 }
 function normRating(v: unknown): Rating {
   return v === 'r15' || v === 'r19' ? v : 'all'
@@ -584,6 +626,7 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       // 구조화 칸은 게시판 양식이 정하므로 여기서는 형태만 지킨다(문자열·문자열 배열·불리언·숫자).
       // 보낸 칸만 덮어쓴다 — 통째로 비우면 양식에서 칸 이름이 바뀌었을 때 예전 값이 영영 사라진다.
       const rich = new Set(strList(input.richFieldKeys, 40, MAX_FORM_KEYS))
+      const linkKeys = new Set(strList(input.linkFieldKeys, 40, MAX_FORM_KEYS))
       // 다만 양식에서 아주 빠진 칸은 걷는다. 안 걷으면 화면에 안 보이는 값이 글에 영원히 쌓이고,
       // 그 값이 붙잡은 그림도 자산 회수에서 살아남아 영영 안 지워진다.
       const known = strList(input.formKeys, 40, MAX_FORM_KEYS)
@@ -595,11 +638,24 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
         for (const [k, v] of Object.entries(input.fields as Record<string, unknown>)) {
           const key = line(k, 40)
           if (!key) continue
+          // 링크 칸은 이름·주소 짝의 목록이다. 주소는 여기서 한 번 거른다 — 화면은 이 값을 그대로 눌러 갈 자리로 그린다.
+          if (linkKeys.has(key)) {
+            post.fields[key] = normLinks(v)
+            continue
+          }
           // 서식 칸은 본문과 같은 화이트리스트를 거쳐야 한다 — 이 값도 화면에서 HTML 로 그려진다.
           if (typeof v === 'string') post.fields[key] = rich.has(key) ? sanitizePostHtml(v.slice(0, MAX_HTML)) : v.slice(0, 4000)
           else if (typeof v === 'number' || typeof v === 'boolean') post.fields[key] = v
           else if (Array.isArray(v)) post.fields[key] = v.slice(0, 60).map((x) => (typeof x === 'string' ? x.slice(0, 500) : '')).filter(Boolean)
         }
+      }
+      // 양식의 첫 태그 칸은 글의 태그 목록이 맡는다 — 같은 값을 칸에도 남기면 글에 두 번 보이고,
+      // 예전 판에서 글씨로 저장된 값이 그 자리에 유령처럼 남는다.
+      const tagsKey = line(input.tagsKey, 40)
+      if (tagsKey) {
+        // 이 칸이 태그를 맡기 전에 쓴 글은 값이 아직 칸에 있다 — 지우기 전에 태그로 옮긴다.
+        if (!post.tags.length) post.tags = strList(tagCell(post.fields[tagsKey]), MAX_TAG, MAX_TAGS)
+        delete post.fields[tagsKey]
       }
       post.updatedAt = now
       if (!doc) {

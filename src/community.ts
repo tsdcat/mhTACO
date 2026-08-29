@@ -174,13 +174,14 @@ export type FieldType =
   | 'image'
   | 'gallery'
   | 'tags'
+  | 'link'
   | 'bgm'
   | 'check'
   | 'confirm'
   | 'divider'
 const FIELD_TYPES: ReadonlySet<string> = new Set<FieldType>([
   'text', 'longtext', 'rich', 'number', 'select', 'multiselect',
-  'image', 'gallery', 'tags', 'bgm', 'check', 'confirm', 'divider'
+  'image', 'gallery', 'tags', 'link', 'bgm', 'check', 'confirm', 'divider'
 ])
 
 export interface FieldDef {

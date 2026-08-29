@@ -98,6 +98,8 @@ export interface UserSummary {
 
 /** 관리자 서버관리용 계정 요약(등급·가입일·마지막 접속 포함 — admin 전용). */
 export interface AdminAccountInfo {
+  /** 로비를 친구에게만 열어 둔 계정인가. 관리 화면이 표시한다. */
+  lobbyPrivate?: boolean
   id: string
   username: string
   nickname?: string
@@ -223,7 +225,11 @@ const MAX_LOBBY_COVER = 400_000 // 음악 트랙 커버 1개
 const MAX_LOBBY_COVER_TOTAL = 5_000_000 // 커버 합계 상한 — accounts.json 비대화·본문 한도 방지(초과분은 제목만 저장)
 const MAX_LOBBY_GALLERY = 60
 const MAX_LOBBY_MUSIC = 200
-const MAX_LOBBY_ICONS = 24
+const MAX_LOBBY_ICON_IMAGES = 24
+// 좌표·이모지·이름·크기·숨김은 아이콘 하나에 수십 바이트뿐이라 그림과 같은 상한을 쓸 이유가 없다.
+// 배치는 아이콘을 하나 옮기면 밀려난 것까지 전부 좌표를 갖게 되므로(겹침 방지), 아이콘 수만큼 항목이 찬다.
+// 본체 14개 + 확장팩 몇 개가 오늘의 최대지만, 확장팩이 늘어도 최근에 옮긴 자리부터 잘리지 않게 넉넉히 둔다.
+const MAX_LOBBY_ICON_ATTRS = 64
 const MAX_LOBBY_MEMO = 4000
 const MAX_LOBBY_DDAY = 40 // 디데이 카드 개수 상한
 const MAX_LOBBY_DDAY_TOTAL = 5_000_000 // 디데이 이미지 합계 상한(accounts.json 비대화·본문 한도 방지)
@@ -301,7 +307,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconImages: Record<string, string> = {}
   if (o.iconImages && typeof o.iconImages === 'object') {
     for (const [k, val] of Object.entries(o.iconImages as Record<string, unknown>)) {
-      if (Object.keys(iconImages).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconImages).length >= MAX_LOBBY_ICON_IMAGES) break
       const img = lobbyImageRef(val, MAX_LOBBY_ICON)
       if (img) iconImages[k.slice(0, 40)] = img
     }
@@ -309,7 +315,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconPos: Record<string, { x: number; y: number }> = {}
   if (o.iconPos && typeof o.iconPos === 'object') {
     for (const [k, val] of Object.entries(o.iconPos as Record<string, unknown>)) {
-      if (Object.keys(iconPos).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconPos).length >= MAX_LOBBY_ICON_ATTRS) break
       const p = val as Record<string, unknown>
       if (p && typeof p.x === 'number' && typeof p.y === 'number' && isFinite(p.x) && isFinite(p.y)) {
         iconPos[k.slice(0, 40)] = { x: Math.round(p.x), y: Math.round(p.y) }
@@ -319,7 +325,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconEmojis: Record<string, string> = {}
   if (o.iconEmojis && typeof o.iconEmojis === 'object') {
     for (const [k, val] of Object.entries(o.iconEmojis as Record<string, unknown>)) {
-      if (Object.keys(iconEmojis).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconEmojis).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'string' && val.trim()) iconEmojis[k.slice(0, 40)] = val.slice(0, 16)
     }
   }
@@ -327,7 +333,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconLabels: Record<string, string> = {}
   if (o.iconLabels && typeof o.iconLabels === 'object') {
     for (const [k, val] of Object.entries(o.iconLabels as Record<string, unknown>)) {
-      if (Object.keys(iconLabels).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconLabels).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'string' && val.trim()) iconLabels[k.slice(0, 40)] = val.trim().slice(0, 24)
     }
   }
@@ -335,7 +341,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const iconSizes: Record<string, number> = {}
   if (o.iconSizes && typeof o.iconSizes === 'object') {
     for (const [k, val] of Object.entries(o.iconSizes as Record<string, unknown>)) {
-      if (Object.keys(iconSizes).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(iconSizes).length >= MAX_LOBBY_ICON_ATTRS) break
       if (typeof val === 'number' && isFinite(val)) iconSizes[k.slice(0, 40)] = Math.min(72, Math.max(32, Math.round(val)))
     }
   }
@@ -343,7 +349,7 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
   const hiddenIcons: Record<string, boolean> = {}
   if (o.hiddenIcons && typeof o.hiddenIcons === 'object') {
     for (const [k, val] of Object.entries(o.hiddenIcons as Record<string, unknown>)) {
-      if (Object.keys(hiddenIcons).length >= MAX_LOBBY_ICONS) break
+      if (Object.keys(hiddenIcons).length >= MAX_LOBBY_ICON_ATTRS) break
       if (val === true) hiddenIcons[k.slice(0, 40)] = true
     }
   }
@@ -742,6 +748,12 @@ export interface AuthStore {
   removeFriend(token: string, userId: string): FriendResult
   /** 내 친구·받은신청·보낸신청 목록(요약). 온라인 표시는 relay 가 덧붙인다. */
   friendList(token: string): FriendListResult
+  /**
+   * 친구 목록 차례를 사람이 정한 대로 바꾼다.
+   * ⚠ 목록에 없는 id 는 버리고, 빠진 친구는 뒤에 붙인다. 차례를 바꾸려던 조작이
+   *   친구를 끊는 일이 되면 안 된다.
+   */
+  reorderFriends(token: string, ids: string[]): { ok: boolean; error?: string }
   /** 토큰 소유 계정의 프로필(닉네임·사진·소개) 부분 갱신. */
   updateProfile(token: string, patch: ProfilePatch): ProfileResult
   /** 수동 프레즌스 상태 저장(계정 영속). 무효 값/계정 없음이면 false. */
@@ -1202,6 +1214,7 @@ export function createAuthStore(opts?: {
           avatar: a.avatar,
           role: a.role,
           createdAt: a.createdAt,
+          lobbyPrivate: a.lobbyPrivate,
           lastSeenAt: a.lastSeenAt
         }))
         .sort((x, y) => x.createdAt - y.createdAt)
@@ -1342,6 +1355,28 @@ export function createAuthStore(opts?: {
         incoming: mapIds(me.friendReqIn),
         outgoing: mapIds(me.friendReqOut)
       }
+    },
+
+    reorderFriends(token, ids) {
+      const meId = accountIdForToken(token)
+      if (!meId) return { ok: false, error: '로그인이 필요합니다.' }
+      const me = accounts.find((x) => x.id === meId)
+      if (!me) return { ok: false, error: '계정을 찾을 수 없습니다.' }
+      const have = me.friends ?? []
+      const want = Array.isArray(ids) ? ids.filter((x) => typeof x === 'string') : []
+      const seen = new Set<string>()
+      const next: string[] = []
+      for (const id of want) {
+        if (have.includes(id) && !seen.has(id)) {
+          seen.add(id)
+          next.push(id)
+        }
+      }
+      // ⚠ 적히지 않은 친구는 원래 차례를 지키며 뒤에 붙인다(버리면 조용한 친구 끊기가 된다).
+      for (const id of have) if (!seen.has(id)) next.push(id)
+      me.friends = next
+      save()
+      return { ok: true }
     },
 
     updateProfile(token, patch) {

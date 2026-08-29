@@ -347,6 +347,8 @@ const BOARD_ROUTES: Record<string, Route> = {
         ...b,
         boardId: s(b.boardId, 64),
         richFieldKeys: (c.board?.form ?? []).filter((f) => f.type === 'rich').map((f) => f.key),
+        linkFieldKeys: (c.board?.form ?? []).filter((f) => f.type === 'link').map((f) => f.key),
+        tagsKey: (c.board?.form ?? []).find((f) => f.type === 'tags')?.key ?? '',
         formKeys: (c.board?.form ?? []).map((f) => f.key),
         charId: who.charId,
         charName: who.charName,
@@ -494,8 +496,11 @@ const BOARD_ROUTES: Record<string, Route> = {
     need: 'board.read',
     scope: 'postId',
     rate: 'social',
-    run(b, _c, d) {
-      d.posts.addView(s(b.postId, 64))
+    run(b, c, d) {
+      const postId = s(b.postId, 64)
+      // 자기 글을 다시 열어 보는 것은 조회가 아니다 — 고치려고 드나들 때마다 숫자가 오르면 세는 뜻이 없다.
+      if (d.posts.summary(postId)?.authorId === c.account.id) return ok()
+      d.posts.addView(postId)
       return ok()
     }
   },

@@ -2014,6 +2014,21 @@ export function createRelay(opts?: {
       })
       return
     }
+    // 친구 목록 차례 바꾸기 — 서버에 남겨 다른 기기·웹판에서도 같은 차례로 보인다.
+    if (req.method === 'POST' && req.url === '/friend/reorder') {
+      withBody(req, res, (body) => {
+        const token = typeof body.token === 'string' ? body.token : ''
+        const ids = Array.isArray(body.ids) ? (body.ids as unknown[]).filter((x): x is string => typeof x === 'string') : []
+        const r = auth.reorderFriends(token, ids)
+        if (r.ok) {
+          const me = auth.verifyToken(token)
+          if (me) io.to('user:' + me.id).emit('friend:update') // 본인 다른 기기 동기화
+        }
+        res.writeHead(r.ok ? 200 : 400, JSON_H)
+        res.end(JSON.stringify(r))
+      })
+      return
+    }
     if (
       req.method === 'POST' &&
       (req.url === '/friend/accept' || req.url === '/friend/reject' || req.url === '/friend/remove')
@@ -2119,6 +2134,8 @@ export function createRelay(opts?: {
             avatar: u.avatar,
             role: u.role,
             createdAt: u.createdAt,
+            // 로비를 친구에게만 열어 둔 계정인가. 관리자가 '왜 이 사람 로비가 안 열리지'를 여기서 바로 안다.
+            lobbyPrivate: !!u.lobbyPrivate,
             lastSeenAt: u.lastSeenAt, // 마지막 접속 일시(로그인·연결/종료 시 갱신)
             online: online.has(u.id),
             // 관리자 대시보드는 실상태(invisible 포함) — 서버 소유자는 어차피 로그로 확인 가능(운영 목적, 위장 대상 아님).

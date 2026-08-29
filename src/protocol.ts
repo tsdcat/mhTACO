@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-08-19'
+export const SERVER_VERSION = '2026-08-20'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
