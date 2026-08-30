@@ -48,6 +48,7 @@ import type {
   Token,
   TokenBar,
   TokenLayer,
+  TokenPlacePlReq,
   TokenUpsertReq,
   TokenZOp,
   VnLayer
@@ -105,13 +106,22 @@ const ARCHIVE_RETRY_MS = 30_000
 const MAX_HISTORY_HARD = MAX_HISTORY * 2
 /** 캐릭터 보관대 상한 — 한 방에서 오간 저널이 아무리 많아도 이만큼만 남긴다(오래된 것부터 덜어 낸다). */
 const MAX_CHAR_POOL = 200
+/** 한 사람이 보관대에 남길 수 있는 항목 수 — 공용 상한만 있으면 한 사람이 charId 를 바꿔 가며
+ *  풀 전체를 채워 다른 사람·GM 의 항목(토큰·화자 각인의 근거)을 조용히 밀어낼 수 있다. */
+const MAX_CHAR_POOL_PER_PLAYER = 16
 /** 맵당 오브젝트 개수 상한 — 방 상태 팽창 방어(coerceLoadedMap 모든 진입점 적용). */
 const MAX_TOKENS_PER_MAP = 2000
+/** 1인당 참가자 창작 오브젝트(ownerPlayerId 스탬프) 상한 — 방 전체(모든 맵) 합산. 초과 배치는 무시. */
+const MAX_PL_OBJECTS_PER_PLAYER = 30
 /** 방이 들고 있는 GM 선택지 개수 상한 — 넘으면 오래된 것부터 버린다(옵션 스크립트가 무거워 무제한 불가). */
 const MAX_ROOM_CHOICES = 100
 const MAX_DRAWINGS_PER_MAP = 2000
 /** 방이 들고 있는 덱 수 상한 — 방 파일과 입장 스냅샷에 통째로 실리므로 끝을 둔다. */
 const MAX_DECKS = 12
+/** 방이 들고 있는 비주얼 카드 수 상한. 화자를 갈라 같은 이름으로 여러 장을 두는 쓰임이 생겨 넉넉히 잡는다. */
+const MAX_VISUAL_CARDS = 60
+/** 카드 한 장에 매어 둘 수 있는 화자 수 — 목록이 방 파일과 스냅샷에 그대로 실리므로 끝을 둔다. */
+const MAX_CARD_SPEAKERS = 16
 /** 한 덱의 카드 정의 수 상한(그림이 붙을 수 있어 넉넉하되 무한은 아니게). */
 const MAX_DECK_CARDS = 120
 /** 같은 카드를 몇 장까지 넣을 수 있는지 — 남은 더미가 카드 정의 수보다 지나치게 부풀지 않게. */
@@ -178,6 +188,7 @@ export interface Room {
   locked?: boolean
   luckEnabled?: boolean // 행운 깎기(CoC7 하우스룰) 사용 여부 — GM 토글·전원 동기화·영속. 미설정=사용(기본).
   vnOverlay?: boolean // 일반 맵 위 VN 오버레이(대사창+발화자 스탠딩) 표시 — GM 토글·전원 동기화·영속. 미설정=꺼짐.
+  plObjects?: boolean // 참가자 오브젝트 추가 허용(이미지 토큰·스티커) — GM 토글·전원 동기화·영속. 미설정=꺼짐.
   /**
    * GM 의 귓속말 열람. 켜 두면 그 뒤로 오가는 1:1 귓속말이 GM 에게도 전달된다 — GM 토글·전원 동기화·영속.
    * 미설정=꺼짐. 열림 여부는 방 설정이 아니라 말마다 찍히는 각인(ChatMessage.gmVisible)이 정하므로,
@@ -255,6 +266,19 @@ export interface VisualCard {
   sound?: string
   soundSec?: number // 음향 재생 길이(초 · 1~600) — 없으면 음원 끝까지
   displaySec?: number // 카드 표시 시간(초 · 1~600) — 없으면 클릭할 때까지 표시
+  /**
+   * 이 카드를 쓸 화자들(보관대 키 = poolKey(playerId, charId)). 비었거나 없으면 누구의 발화에도 뜬다.
+   *
+   * ⚠ charId 만으로는 사람을 못 가린다 — 캐릭터를 장착하지 않은 발화의 charId 는 사람마다 값이 같은
+   *    'owner' 고정 문자열이다. 그래서 보관대와 같은 (사람, 캐릭터) 쌍을 열쇠로 쓴다.
+   */
+  for?: string[]
+}
+
+/** 카드를 고를 때 보는 발화자. 서버가 발화 시점에 각인한 값을 그대로 넘긴다(클라 전송값이 아니다). */
+export interface CardSpeaker {
+  playerId?: string
+  charId?: string
 }
 
 /** 세션방 목록 항목(room:list). 카드·메타만 — 장면/채팅 본문은 입장 시 스냅샷으로. 클라 protocol 과 미러. */
@@ -548,6 +572,7 @@ function coerceToken(t: unknown): Token | null {
     bars: coerceBars(o.bars),
     statsPrivate: o.statsPrivate === true ? true : undefined,
     importId: capId(o.importId), // 가져오기 출처 태그(로드·가져오기 보존)
+    ownerPlayerId: capId(o.ownerPlayerId), // 참가자 창작 오브젝트 소유자(로드 보존 — 재시작해도 제 것만 만진다)
     mapIds: coercePlayerIds(o.mapIds), // 표시 맵 제한(통합 레이어 · 로드·가져오기 보존)
     liveStanding: o.liveStanding === true ? true : undefined, // 라이브 스탠딩 토큰(로스터 참조 렌더)
     // 버튼 토큰 — hover/press 교체 이미지·상태별 효과음(디스크 로드 시 보존).
@@ -698,6 +723,10 @@ function coerceLoadedHandout(h: unknown): Handout | null {
     title: typeof o.title === 'string' ? o.title.slice(0, 200) : '',
     body: typeof o.body === 'string' ? o.body.slice(0, 20000) : '',
     image: capImage(o.image),
+    imageAlign: o.imageAlign === 'center' || o.imageAlign === 'right' ? o.imageAlign : undefined,
+    folder: typeof o.folder === 'string' && o.folder ? o.folder.slice(0, 60) : undefined,
+    // 정렬 키가 없으면 없는 그대로 둔다 — 옛 데이터는 createdAt 폴백으로 생성순 유지.
+    sortKey: typeof o.sortKey === 'number' && Number.isFinite(o.sortKey) ? o.sortKey : undefined,
     tags: Array.isArray(o.tags) ? o.tags.filter((t): t is string => typeof t === 'string').slice(0, 40) : [],
     scope,
     targets:
@@ -1101,12 +1130,34 @@ function coerceDecks(v: unknown): Deck[] | undefined {
   return out.length ? out : undefined
 }
 
-/** 비주얼 카드 배열 정규화(로드용) — 최대 30, 이름 필수·40캡, 이미지/음향 캡·둘 다 없으면 제외. 빈 결과=undefined. */
+/**
+ * 카드 화자 목록 정규화 — 문자열 열쇠만, 중복 제거, 개수·길이 캡. 빈 결과=undefined(전원 공용).
+ *
+ * ⚠ 이 함수를 지나는 자리가 둘이다(와이어 진입 setVisualCard, 디스크 로드 coerceVisualCards).
+ *    한쪽만 태우면 '설정 직후엔 되는데 서버를 다시 켜면 전원에게 뜬다'가 된다 — 제한이 풀리는
+ *    방향이라 눈에 잘 안 띄고, 감춰 둔 연출이 새어 나가는 쪽으로 어긋난다.
+ */
+function coerceCardSpeakers(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined
+  const out: string[] = []
+  for (const k of v) {
+    if (out.length >= MAX_CARD_SPEAKERS) break
+    if (typeof k !== 'string') continue
+    const key = k.trim()
+    // ⚠ 긴 열쇠는 자르지 않고 버린다. 잘라 두면 그 열쇠는 어떤 화자와도 안 맞아, 카드가 '아무에게도
+    //    안 뜨는' 상태로 조용히 남는다. 정상 열쇠는 (사람 id + 캐릭터 id) 라 여든 자를 넘지 않는다.
+    if (!key || key.length > 200 || out.includes(key)) continue
+    out.push(key)
+  }
+  return out.length ? out : undefined
+}
+
+/** 비주얼 카드 배열 정규화(로드용) — 개수 상한, 이름 필수·40캡, 이미지/음향 캡·둘 다 없으면 제외. 빈 결과=undefined. */
 function coerceVisualCards(v: unknown): VisualCard[] | undefined {
   if (!Array.isArray(v)) return undefined
   const out: VisualCard[] = []
   for (const c of v) {
-    if (out.length >= 30) break
+    if (out.length >= MAX_VISUAL_CARDS) break
     if (!c || typeof c !== 'object') continue
     const o = c as Record<string, unknown>
     const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, 40)
@@ -1120,7 +1171,8 @@ function coerceVisualCards(v: unknown): VisualCard[] | undefined {
       image,
       sound,
       soundSec: coerceSoundSec(o.soundSec, sound),
-      displaySec: coerceDisplaySec(o.displaySec, image)
+      displaySec: coerceDisplaySec(o.displaySec, image),
+      for: coerceCardSpeakers(o.for)
     })
   }
   return out.length ? out : undefined
@@ -1153,6 +1205,7 @@ function poolSubset(c: SharedCharacter): SharedCharacter {
     color: c.color,
     nameColor: c.nameColor,
     headshot: c.headshot, // 원형 토큰 그림
+    headshots: c.headshots, // 표정별 두상 — 보관대 화자의 채팅 두상 각인이 표정을 따라가게 함께 담는다
     standings: c.standings, // 스탠딩 토큰(자산 참조라 가볍다)
     currentExpression: c.currentExpression,
     standingHeight: c.standingHeight,
@@ -1175,6 +1228,7 @@ function loadCharPool(v: unknown): Map<string, SharedCharacter> {
       name: typeof c.name === 'string' ? c.name.slice(0, 100) : '',
       color: typeof c.color === 'string' ? c.color.slice(0, 32) : '#7c9cff',
       headshot: capImage(c.headshot),
+      headshots: c.headshots ? capImageList(c.headshots) : undefined,
       standings: capImageList(c.standings)
     }))
   }
@@ -1231,6 +1285,7 @@ function roomToFile(room: Room): Record<string, unknown> {
     luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
     locked: room.locked, // 입실 잠금(공사중)
     vnOverlay: room.vnOverlay, // 일반 맵 VN 오버레이 표시 여부
+    plObjects: room.plObjects, // 참가자 오브젝트 추가 허용 여부
     gmSeeWhispers: room.gmSeeWhispers, // GM 귓속말 열람 여부
     bgm: room.bgm,
     channels: [...room.channels.values()],
@@ -1341,6 +1396,7 @@ function roomFromFile(data: unknown): Room | null {
     locked: o.locked === true ? true : undefined, // 입실 잠금(공사중)
     luckEnabled: typeof o.luckEnabled === 'boolean' ? o.luckEnabled : undefined, // 행운 깎기 사용 여부(미설정=기본 사용)
     vnOverlay: typeof o.vnOverlay === 'boolean' ? o.vnOverlay : undefined, // VN 오버레이 표시 여부(미설정=꺼짐)
+    plObjects: typeof o.plObjects === 'boolean' ? o.plObjects : undefined, // 참가자 오브젝트 추가 허용(미설정=꺼짐)
     gmSeeWhispers: o.gmSeeWhispers === true ? true : undefined, // GM 귓속말 열람 여부(미설정=꺼짐)
     bgm: coerceLoadedBgmList(o.bgm),
     combat: null, // 전투는 in-memory(비영속) — 재시작 시 초기화
@@ -2805,6 +2861,15 @@ export class RoomStore {
     return { ok: true, enabled }
   }
 
+  /** 참가자 오브젝트 추가 허용 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환. */
+  setPlObjects(roomId: string, enabled: boolean): { ok: boolean; enabled: boolean } {
+    const room = this.rooms.get(roomId)
+    if (!room) return { ok: false, enabled: false }
+    room.plObjects = enabled
+    room.lastActivityAt = Date.now()
+    return { ok: true, enabled }
+  }
+
   /**
    * GM 귓속말 열람 설정(GM 전용 — 권한 검증은 호출 측 relay). {ok,enabled} 반환.
    * 켜고 끄는 것은 앞으로 오갈 말에만 미친다 — 이미 오간 말의 각인은 손대지 않는다.
@@ -3123,6 +3188,11 @@ export class RoomStore {
     // 지운 뒤 다시 넣어 '가장 최근'이 맨 뒤로 가게 한다 — Map 은 이미 있는 키를 덮어써도 자리를 안 바꾼다.
     // 그대로 두면 아래 축출이 '오래 안 쓴 것'이 아니라 '먼저 담긴 것'을 버려, 지금 쓰는 캐릭터가 밀려난다.
     room.charPool.delete(key)
+    // 1인당 할당량부터 정리한다 — 넘치는 몫은 그 사람의 가장 오래된 자기 항목에서만 걷어,
+    // 한 사람의 등록 폭주가 남의 보관대를 밀어내지 못하게 한다(방 공용 상한은 마지막 방어선).
+    const head = char.playerId.length + ':' + char.playerId
+    const mine = [...room.charPool.keys()].filter((k) => k.startsWith(head))
+    for (let i = 0; i <= mine.length - MAX_CHAR_POOL_PER_PLAYER; i++) room.charPool.delete(mine[i])
     room.charPool.set(key, poolSubset(char))
     trimCharPool(room)
   }
@@ -3137,6 +3207,45 @@ export class RoomStore {
   charPool(roomId: string): SharedCharacter[] {
     const room = this.rooms.get(roomId)
     return room ? [...room.charPool.values()] : []
+  }
+
+  /**
+   * 보관대에서 한 사람의 캐릭터 한 벌을 찾는다 — 메시지에 실려 온 charId 를 화자로 각인할 때 쓴다.
+   * 키가 (playerId, charId) 라 남의 캐릭터는 애초에 닿지 않는다.
+   */
+  pooledCharacter(roomId: string, playerId: string, charId: string): SharedCharacter | undefined {
+    const room = this.rooms.get(roomId)
+    return room?.charPool.get(poolKey(playerId, charId))
+  }
+
+  /**
+   * 장착 슬롯(room.characters)은 건드리지 않고 보관대에만 담는다 — 분리 창이 제 화자를 등록하는 길.
+   * 값 깎기(이미지 캡·길이 바운드)는 setCharacter 와 같은 규칙을 태워야 하므로 여기서 직접 한다.
+   */
+  poolCharacter(roomId: string, char: SharedCharacter): SharedCharacter | undefined {
+    const room = this.rooms.get(roomId)
+    if (!room) return undefined
+    const standings = capImageList(char.standings)
+    const max = Math.max(0, standings.length - 1)
+    const stored: SharedCharacter = {
+      ...char,
+      charId: capId(char.charId) ?? '',
+      name: typeof char.name === 'string' ? char.name.slice(0, 100) : '',
+      color: typeof char.color === 'string' ? char.color.slice(0, 32) : '#7c9cff',
+      nameColor: typeof char.nameColor === 'string' ? char.nameColor.slice(0, 32) : undefined,
+      headshot: capImage(char.headshot),
+      headshots: char.headshots ? capImageList(char.headshots) : undefined,
+      standings,
+      currentExpression: Math.min(Math.max(0, char.currentExpression), max),
+      standingHeight:
+        typeof char.standingHeight === 'number' && Number.isFinite(char.standingHeight)
+          ? Math.min(4000, Math.max(40, Math.round(char.standingHeight)))
+          : undefined
+    }
+    if (!stored.charId) return undefined
+    this.setPooledCharacter(room, stored)
+    room.lastActivityAt = Date.now()
+    return room.charPool.get(poolKey(stored.playerId, stored.charId))
   }
 
   /**
@@ -3165,6 +3274,9 @@ export class RoomStore {
     if (!char) return undefined
     const max = Math.max(0, char.standings.length - 1)
     char.currentExpression = Math.min(Math.max(0, index), max)
+    // 표정은 보관대 사본에도 따라 붙인다 — 사본이 낡으면 이 캐릭터를 charId 로 각인한 다음 말의
+    // 두상이 옛 표정으로 남는다(잦은 전환이지만 사본 교체는 Map 두 번 손대는 값싼 일).
+    if (char.charId) this.setPooledCharacter(room, char)
     room.lastActivityAt = Date.now()
     return char.currentExpression
   }
@@ -3180,6 +3292,17 @@ export class RoomStore {
     const now = Date.now()
     const existing = typeof req.id === 'string' ? room.handouts.get(req.id) : undefined
     const scope: HandoutScope = req.scope === 'all' || req.scope === 'targeted' ? req.scope : 'private'
+    // 정렬 키는 요청으로 안 받는다(재배치는 handout:reorder 전용) — 기존 값 보존, 신규는 맨 끝.
+    // 키 없는 옛 핸드아웃은 createdAt 으로 정렬되므로 최댓값은 sortKey·createdAt 을 함께 본다.
+    let sortKey = existing?.sortKey
+    if (!existing) {
+      let max = 0
+      for (const h of room.handouts.values()) {
+        if (typeof h.sortKey === 'number' && h.sortKey > max) max = h.sortKey
+        if (h.createdAt > max) max = h.createdAt
+      }
+      sortKey = max + 1
+    }
     const handout: Handout = {
       // 기존이면 그 id 유지, 신규면 클라 제공 id 존중(GM 전용 경로 — 낙관적 선택용), 없으면 생성.
       id: existing?.id ?? (typeof req.id === 'string' && req.id ? req.id : randomUUID()),
@@ -3187,6 +3310,10 @@ export class RoomStore {
       body: typeof req.body === 'string' ? req.body.slice(0, 20000) : '',
       image: capImage(req.image),
       imageAlign: req.imageAlign === 'center' || req.imageAlign === 'right' ? req.imageAlign : undefined,
+      // 빈 문자열은 폴더 해제. 키가 아예 없으면 기존 폴더 유지(옛 클라 요청이 폴더를 걷어내지 않게).
+      folder:
+        typeof req.folder === 'string' ? req.folder.trim().slice(0, 60) || undefined : existing?.folder,
+      sortKey,
       tags: Array.isArray(req.tags) ? req.tags.filter((t) => typeof t === 'string').slice(0, 40) : [],
       scope,
       targets:
@@ -3211,6 +3338,44 @@ export class RoomStore {
     room.handouts.delete(id)
     room.lastActivityAt = Date.now()
     return prev
+  }
+
+  /**
+   * 핸드아웃 순서 변경 — 대상을 beforeId 앞(없으면 맨 끝)으로. 전체를 (sortKey ?? createdAt)
+   * 오름차순으로 놓고 이웃 둘의 중간값을 새 키로 준다. 중간값이 이웃과 같아질 만큼 간격이
+   * 좁아지면 전체를 0..n 으로 재번호. 반환은 키가 바뀐 핸드아웃들(평소 1개 · 재번호 시 전부) —
+   * 호출 측이 그대로 재방송한다. 방·대상이 없으면 undefined.
+   */
+  reorderHandout(roomId: string, id: string, beforeId?: string): Handout[] | undefined {
+    const room = this.rooms.get(roomId)
+    if (!room) return undefined
+    const target = room.handouts.get(id)
+    if (!target) return undefined
+    if (beforeId === id) return [] // 자기 앞으로 = 제자리
+    const keyOf = (h: Handout): number => h.sortKey ?? h.createdAt
+    const rest = [...room.handouts.values()]
+      .filter((h) => h.id !== id)
+      .sort((a, b) => keyOf(a) - keyOf(b) || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
+    const at = typeof beforeId === 'string' ? rest.findIndex((h) => h.id === beforeId) : -1
+    const idx = at === -1 ? rest.length : at // beforeId 없음(삭제됨 포함)=맨 끝
+    const prev = idx > 0 ? keyOf(rest[idx - 1]) : undefined
+    const next = idx < rest.length ? keyOf(rest[idx]) : undefined
+    let key: number
+    if (prev !== undefined && next !== undefined) key = (prev + next) / 2
+    else if (next !== undefined) key = next - 1
+    else if (prev !== undefined) key = prev + 1
+    else key = 0 // 혼자 남은 목록 — 어떤 키든 무방
+    room.lastActivityAt = Date.now()
+    // 간격 소진 — 중간값이 이웃과 겹치면(부동소수 정밀도 바닥) 새 차례대로 전체 재번호.
+    if (key === prev || key === next) {
+      rest.splice(idx, 0, target)
+      rest.forEach((h, i) => {
+        h.sortKey = i
+      })
+      return rest
+    }
+    target.sortKey = key
+    return [target]
   }
 
   getHandout(roomId: string, id: string): Handout | undefined {
@@ -3454,7 +3619,7 @@ export class RoomStore {
   }
 
   // ===== 비주얼 카드 — GM 등록·전원 동기화 · 영속 =====
-  /** 카드 추가/갱신(GM). id 있으면 갱신, 없으면 신규(최대 30). 이미지·음향 둘 다 없으면 무시. 정규화 목록 반환. */
+  /** 카드 추가/갱신(GM). id 있으면 갱신, 없으면 신규(MAX_VISUAL_CARDS 까지). 이미지·음향 둘 다 없으면 무시. 정규화 목록 반환. */
   setVisualCard(roomId: string, req: unknown): VisualCard[] | undefined {
     const room = this.rooms.get(roomId)
     if (!room || !req || typeof req !== 'object') return undefined
@@ -3473,11 +3638,12 @@ export class RoomStore {
       image,
       sound,
       soundSec: coerceSoundSec(o.soundSec, sound),
-      displaySec: coerceDisplaySec(o.displaySec, image)
+      displaySec: coerceDisplaySec(o.displaySec, image),
+      for: coerceCardSpeakers(o.for)
     }
     if (i >= 0) cards[i] = card
     else {
-      if (cards.length >= 30) return undefined
+      if (cards.length >= MAX_VISUAL_CARDS) return undefined
       cards.push(card)
     }
     room.visualCards = cards
@@ -3610,11 +3776,37 @@ export class RoomStore {
     return { deck, cards: drawn }
   }
 
+  /**
+   * 이번 발화에서 볼 카드 뭉치를 둘로 나눈다 — [이 화자에게 매어 둔 것, 누구에게나 열린 것].
+   *
+   * ⚠ 나누는 일이 먼저고 고르는 일이 나중이다. 이름 구체성으로 한 장을 먼저 뽑고 나서 화자를
+   *    걸러 내면, 공용 '대성공' 카드가 이겨서 뽑힌 뒤 그 자리에서 탈락해 **아무것도 안 뜬다**.
+   *    화자에게 매어 둔 카드가 하나라도 걸리면 공용은 아예 보지 않는다.
+   */
+  private cardTiers(roomId: string, sp?: CardSpeaker): [VisualCard[], VisualCard[]] {
+    const cards = this.rooms.get(roomId)?.visualCards
+    if (!cards?.length) return [[], []]
+    const key = poolKey(sp?.playerId, sp?.charId)
+    const mine: VisualCard[] = []
+    const shared: VisualCard[] = []
+    for (const c of cards) {
+      if (!c.for?.length) shared.push(c)
+      // 화자를 알 수 없는 발화(GM 의 1회성 NPC·charId 를 안 싣는 옛 클라)는 열쇠가 빈 문자열이라
+      // 어느 화자 카드에도 걸리지 않는다 — 공용 카드만 뜬다. '모르면 통과'로 두면 매어 둔 뜻이 없어진다.
+      else if (key && c.for.includes(key)) mine.push(c)
+    }
+    return [mine, shared]
+  }
+
   /** 다이스 결과 라벨로 카드 찾기 — 라벨('대성공' 등)이 카드 이름과 정확히 일치하면 그 카드(트리거용). */
-  findCardByTitle(roomId: string, text: string): VisualCard | undefined {
+  findCardByTitle(roomId: string, text: string, sp?: CardSpeaker): VisualCard | undefined {
     const t = text.trim()
     if (!t) return undefined
-    return this.rooms.get(roomId)?.visualCards?.find((c) => c.name === t)
+    for (const tier of this.cardTiers(roomId, sp)) {
+      const hit = tier.find((c) => c.name === t)
+      if (hit) return hit
+    }
+    return undefined
   }
 
   /**
@@ -3629,51 +3821,59 @@ export class RoomStore {
    *
    * @param keys 이번 결과의 라벨들(구체적인 것이 앞).
    * @param allKeys 이 룰에서 나올 수 있는 라벨 전부 — 어느 라벨이 더 구체적인지 견주는 데 쓴다.
+   * @param sp 이번 발화의 화자 — 매어 둔 카드를 먼저 본다.
    */
-  findCardForResult(roomId: string, keys: string[], allKeys: string[]): VisualCard | undefined {
-    const cards = this.rooms.get(roomId)?.visualCards
-    if (!cards?.length || !keys.length) return undefined
+  findCardForResult(roomId: string, keys: string[], allKeys: string[], sp?: CardSpeaker): VisualCard | undefined {
+    if (!keys.length) return undefined
     // keys 는 구체적인 것이 앞이다('대성공' → '성공'). 그 차례를 점수로 삼아, 더 구체적인 라벨을 뜻하는
     // 카드가 언제나 이긴다. 등록 순서로 이기게 두면 '성공' 카드를 먼저 만든 방에서 대성공에도 그것이 뜬다.
     const rank = new Map(keys.map((k, i) => [k, i]))
-    let hit: VisualCard | undefined
-    let hitRank = Number.MAX_SAFE_INTEGER
-    let hitExact = false
-    for (const c of cards) {
-      const name = (c.name ?? '').trim()
-      if (!name) continue
-      // 이름이 라벨 그대로면 그 라벨을 뜻하는 것이 분명하다. 아니면 이름이 품은 라벨 중 가장 긴 것으로 본다.
-      const exact = rank.has(name)
-      let best = ''
-      if (!exact) for (const k of allKeys) if (k && name.includes(k) && k.length > best.length) best = k
-      const key = exact ? name : best
-      const r = key ? rank.get(key) : undefined
-      if (r === undefined) continue
-      // 같은 구체성이면 이름이 라벨과 똑같은 쪽을 먼저, 그다음은 등록순.
-      if (r < hitRank || (r === hitRank && exact && !hitExact)) {
-        hit = c
-        hitRank = r
-        hitExact = exact
+    const pick = (cards: VisualCard[]): VisualCard | undefined => {
+      let hit: VisualCard | undefined
+      let hitRank = Number.MAX_SAFE_INTEGER
+      let hitExact = false
+      for (const c of cards) {
+        const name = (c.name ?? '').trim()
+        if (!name) continue
+        // 이름이 라벨 그대로면 그 라벨을 뜻하는 것이 분명하다. 아니면 이름이 품은 라벨 중 가장 긴 것으로 본다.
+        const exact = rank.has(name)
+        let best = ''
+        if (!exact) for (const k of allKeys) if (k && name.includes(k) && k.length > best.length) best = k
+        const key = exact ? name : best
+        const r = key ? rank.get(key) : undefined
+        if (r === undefined) continue
+        // 같은 구체성이면 이름이 라벨과 똑같은 쪽을 먼저, 그다음은 등록순.
+        if (r < hitRank || (r === hitRank && exact && !hitExact)) {
+          hit = c
+          hitRank = r
+          hitExact = exact
+        }
       }
+      return hit
     }
-    return hit
+    for (const tier of this.cardTiers(roomId, sp)) {
+      const hit = pick(tier)
+      if (hit) return hit
+    }
+    return undefined
   }
   /**
    * 채팅·스크립트 본문으로 카드 찾기 — 화면에 보이는 평문 기준으로 카드 이름이 '포함'되면 그 카드.
    * 문장 속 키워드·스크립트 본문 키워드도 발동한다. 여러 카드가 매칭되면 이름이 긴(더 구체적인) 카드
-   * 우선, 동률은 등록순.
+   * 우선, 동률은 등록순. 화자에게 매어 둔 카드가 걸리면 공용보다 먼저다.
    */
-  findCardInText(roomId: string, text: string): VisualCard | undefined {
+  findCardInText(roomId: string, text: string, sp?: CardSpeaker): VisualCard | undefined {
     const t = stripChatMarkup(text).trim()
     if (!t) return undefined
-    const cards = this.rooms.get(roomId)?.visualCards
-    if (!cards?.length) return undefined
-    let hit: VisualCard | undefined
-    for (const c of cards) {
-      if (!c.name || !t.includes(c.name)) continue
-      if (!hit || c.name.length > hit.name.length) hit = c
+    for (const tier of this.cardTiers(roomId, sp)) {
+      let hit: VisualCard | undefined
+      for (const c of tier) {
+        if (!c.name || !t.includes(c.name)) continue
+        if (!hit || c.name.length > hit.name.length) hit = c
+      }
+      if (hit) return hit
     }
-    return hit
+    return undefined
   }
   /** id 로 카드 조회(수동 재생용). */
   getVisualCard(roomId: string, cardId: string): VisualCard | undefined {
@@ -3884,6 +4084,8 @@ export class RoomStore {
         req.statsPrivate === true ? true : req.statsPrivate === false ? undefined : existing?.statsPrivate,
       // 가져오기 출처 태그 — 편집(upsert)으로는 바뀌지 않는다(가져오기·로드에서만 부여).
       importId: existing?.importId,
+      // 참가자 창작 오브젝트 소유자 — 편집으로는 바뀌지 않는다(참가자 배치에서만 서버가 스탬프).
+      ownerPlayerId: existing?.ownerPlayerId,
       // 표시 맵 제한 — null 이면 해제(모든 맵에 표시), 배열이면 그 목록, 미지정이면 기존 보존.
       // 가져오기가 박아 둔 제한을 사람이 풀 수 있어야 한다(못 풀면 새 맵세트가 빈 판으로 보인다).
       mapIds:
@@ -3922,6 +4124,52 @@ export class RoomStore {
     }
     tokens.set(token.id, token)
     room.lastActivityAt = Date.now()
+    return token
+  }
+
+  /**
+   * 참가자 오브젝트 배치/갱신 — 요청 필드를 화이트리스트로만 옮겨 upsertToken 에 태운다(클램프·이미지 캡 공유).
+   * 신규면 ownerPlayerId=playerId 를 스탬프하고, id 가 기존 토큰이면 그 토큰의 소유자가 본인일 때만 갱신한다
+   * (GM·다른 참가자의 토큰을 덮어쓰는 길 차단). 통합 레이어(GLOBAL_MAP_ID)는 방을 넘어 남으므로 배치 거부.
+   * 방 설정(plObjects) 검사는 호출 측(relay).
+   */
+  placePlToken(roomId: string, mapId: string, playerId: string, req: TokenPlacePlReq): Token | undefined {
+    const room = this.rooms.get(roomId)
+    if (!room || mapId === GLOBAL_MAP_ID) return undefined
+    const tokens = this.tokenColl(room, mapId)
+    if (!tokens) return undefined
+    // id 는 길이 캡을 넘으면 통째로 무시(신규 취급) — 거대한 문자열이 키로 남는 것 방지.
+    const reqId = typeof req.id === 'string' && req.id && req.id.length <= 200 ? req.id : undefined
+    const existing = reqId ? tokens.get(reqId) : undefined
+    if (existing && existing.ownerPlayerId !== playerId) return undefined // 남의 토큰 갱신 금지
+    if (!existing) {
+      // 1인당 참가자 오브젝트 상한(방 전체·모든 맵 합산) — 초과 배치는 무시.
+      let mine = 0
+      for (const m of room.maps.values())
+        for (const t of m.tokens.values()) if (t.ownerPlayerId === playerId) mine++
+      if (mine >= MAX_PL_OBJECTS_PER_PLAYER) return undefined
+    }
+    // 안전 부분집합만 복사 — 공개범위·상태바·클릭 동작·권한 명단 등 GM 전용 필드는 여기서 원천 차단.
+    const safe: TokenUpsertReq = {
+      mapId,
+      id: reqId,
+      x: req.x,
+      y: req.y,
+      size: req.size,
+      w: req.w,
+      h: req.h,
+      rotation: req.rotation,
+      label: req.label,
+      color: req.color,
+      image: req.image,
+      images: req.images,
+      flipX: req.flipX,
+      layer: req.layer // 정규화(coerceLayer)는 upsertToken 이 담당
+    }
+    const token = this.upsertToken(roomId, mapId, safe)
+    if (!token) return undefined
+    // 신규 배치에만 소유자 각인 — upsertToken 이 저장한 그 객체에 직접 남긴다(요청으로는 못 바꾼다).
+    if (!existing) token.ownerPlayerId = playerId
     return token
   }
 
@@ -4530,9 +4778,12 @@ export class RoomStore {
       // 잠금은 복제본에 옮기지 않는다 — 복사한 방은 새로 준비하는 방이라 문을 열어 둔 채 시작한다.
       luckEnabled: src.luckEnabled, // 행운 깎기 사용 여부 복제
       vnOverlay: src.vnOverlay, // VN 오버레이 표시 여부 복제
+      plObjects: src.plObjects, // 참가자 오브젝트 추가 허용 여부 복제
       gmSeeWhispers: src.gmSeeWhispers, // GM 귓속말 열람 여부 복제(대화는 복제하지 않으므로 각인은 따라가지 않는다)
       // 덱은 정의만 옮기고 판은 처음부터 — 복사한 방은 새로 시작하는 방이다.
       decks: src.decks?.map((d) => ({ ...d, cards: d.cards.map((c) => ({ ...c })), draw: shufflePile(deckPile(d.cards)), discard: [] })),
+      // 비주얼 카드도 옮긴다. 매어 둔 화자(for)는 보관대를 함께 복사하므로 사본에서도 그대로 가리킨다.
+      visualCards: src.visualCards?.map((c) => ({ ...c, ...(c.for ? { for: [...c.for] } : {}) })),
       bgm: src.bgm.map((t) => ({ ...t })),
       combat: null,
       channels: new Map(),
@@ -4606,6 +4857,8 @@ export class RoomStore {
       locked: room.locked, // 입실 잠금(공사중)
       luckEnabled: room.luckEnabled, // 행운 깎기 사용 여부
       vnOverlay: room.vnOverlay, // VN 오버레이 표시 여부
+      // 참가자 오브젝트 추가 허용 — 항상 불리언으로 실어, 필드 유무로 클라가 구서버(기능 없음)를 가려낸다.
+      plObjects: room.plObjects === true,
       gmSeeWhispers: room.gmSeeWhispers, // GM 귓속말 열람 여부
       bgm: room.bgm,
       combat: room.combat,

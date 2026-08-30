@@ -5,7 +5,7 @@
 //      열린다. guest 는 프로필 편집·세션방 PL 참여만 가능(호스팅 용량 보호용 안전장치).
 //   ② 방 역할 GM/PL(rooms.ts, 생성자=소유자=GM)은 ①과 별개로 방 안에서만 의미를 가진다.
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, unlinkSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { collectAssetRefs as scanAssetRefs } from './assets'
 import type { PresenceStatus, ProfileLink, ProfileTheme } from './protocol'
@@ -41,6 +41,31 @@ function lobbyImageRef(v: unknown, maxLen: number, audio = false): string | unde
   if (ASSET_REF_RE.test(v)) return v
   const re = audio ? /^data:audio\/[a-z0-9.+-]+[;,]/i : /^data:image\/[a-z0-9.+-]+[;,]/i
   return re.test(v) ? v.slice(0, maxLen) : undefined
+}
+
+/**
+ * 그림 틀 정규화 — 숫자 몇 개만 통과시킨다. 클라와 같은 한계를 여기서 다시 건다.
+ * ⚠ 여기 없는 칸은 조용히 사라진다(스냅샷은 화이트리스트로 새로 지어진다). 그러면 발행은 성공한
+ *    것처럼 보이는데 새 기기에서 되받을 때 그 값만 없다.
+ * 높이는 위젯마다 한계가 다르지만 서버는 어느 위젯 것인지 모른다 — 두 한계를 아우르는 범위로 받고,
+ * 실제 위젯 한계는 그리는 쪽(클라 normalizeFrame)이 다시 좁힌다.
+ */
+function lobbyImageFrame(v: unknown): LobbyImageFrame | undefined {
+  if (!v || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  const num = (x: unknown, lo: number, hi: number): number | undefined =>
+    typeof x === 'number' && Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : undefined
+  const out: LobbyImageFrame = {}
+  const h = num(o.h, 96, 460)
+  if (h !== undefined) out.h = Math.round(h)
+  if (o.fit === 'contain' || o.fit === 'cover') out.fit = o.fit
+  const zoom = num(o.zoom, 1, 3)
+  if (zoom !== undefined) out.zoom = Math.round(zoom * 100) / 100
+  const x = num(o.x, 0, 100)
+  if (x !== undefined) out.x = Math.round(x)
+  const y = num(o.y, 0, 100)
+  if (y !== undefined) out.y = Math.round(y)
+  return Object.keys(out).length ? out : undefined
 }
 
 /** 프로필 색 테마 정규화 — 모든 값 hex 검증. 전부 비면 undefined(제거). */
@@ -122,6 +147,7 @@ export interface LobbyGalleryItem {
   memo: string
   colors: string[]
   image?: string
+  frame?: LobbyImageFrame
 }
 export interface LobbyDDayItem {
   title: string
@@ -129,6 +155,18 @@ export interface LobbyDDayItem {
   mode: 'until' | 'since'
   date: string
   image?: string
+  frame?: LobbyImageFrame
+}
+/**
+ * 그림을 담는 틀 — 크기·채움·확대·자리. 그림 자체는 건드리지 않고 '보여 주는 방법'만 담는다.
+ * 숫자 몇 개라 용량 예산과 무관하고, 잘라 구운 사본을 따로 저장하지 않아도 방문자가 같은 모양으로 본다.
+ */
+export interface LobbyImageFrame {
+  h?: number
+  fit?: 'cover' | 'contain'
+  zoom?: number
+  x?: number
+  y?: number
 }
 /** 공개 캘린더 일정 1건(읽기전용 — 텍스트·색만). */
 export interface LobbyCalEvent {
@@ -176,6 +214,8 @@ export interface LobbyMusicTrack {
   cover?: string
   /** 오디오 'asset:<해시>' 참조(또는 data URL). 본인 조회에서만 응답에 실린다. */
   src: string
+  /** 곡별 음량(0~1). 미설정=1. 기기의 전체 볼륨과 곱해져 실제 소리가 된다. */
+  volume?: number
 }
 /** 세션 BGM 라이브러리 1곡 — 기기(IndexedDB)에 있던 목록을 계정에 얹어 웹·프로그램이 같은 목록을 본다.
  *  로비 음악과 마찬가지로 본인만 조회할 수 있다(방문자에게 내주지 않는다). */
@@ -281,11 +321,13 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
     for (const g of o.gallery as Record<string, unknown>[]) {
       if (gallery.length >= MAX_LOBBY_GALLERY) break
       if (!g || typeof g !== 'object') continue
+      const frame = lobbyImageFrame(g.frame)
       gallery.push({
         title: typeof g.title === 'string' ? g.title.slice(0, 60) : '',
         memo: typeof g.memo === 'string' ? g.memo.slice(0, 300) : '',
         colors: Array.isArray(g.colors) ? (g.colors as unknown[]).slice(0, 4).map((c) => hexColor(c) ?? '') : [],
-        image: lobbyImageRef(g.image, MAX_LOBBY_IMAGE)
+        image: lobbyImageRef(g.image, MAX_LOBBY_IMAGE),
+        ...(frame ? { frame } : {})
       })
     }
   }
@@ -362,13 +404,15 @@ function sanitizeLobby(v: unknown): LobbySnapshot | null {
       const image = lobbyImageRef(d.image, MAX_LOBBY_IMAGE)
       const keepImg = image && image.length <= ddayBudget
       if (keepImg) ddayBudget -= image!.length
+      const frame = lobbyImageFrame(d.frame)
       ddays.push({
         title: typeof d.title === 'string' ? d.title.slice(0, 60) : '',
         emoji: typeof d.emoji === 'string' ? d.emoji.slice(0, 8) : '',
         mode: d.mode === 'since' ? 'since' : 'until',
         // 날짜는 'YYYY-MM-DD' 만 허용(그 외는 빈 문자열 → 클라가 안전 처리).
         date: typeof d.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d.date) ? d.date : '',
-        ...(keepImg ? { image } : {})
+        ...(keepImg ? { image } : {}),
+        ...(frame ? { frame } : {})
       })
     }
   }
@@ -506,12 +550,16 @@ function sanitizeLobbyMusic(v: unknown): LobbyMusicTrack[] | null {
     if (src.length > srcBudget) continue
     srcBudget -= src.length
     const title = typeof raw.title === 'string' ? raw.title.slice(0, 200) : ''
+    // ⚠ 여기는 필드를 하나씩 적어 새로 짓는 자리다. 안 적으면 조용히 사라진다(보관함에 올렸다 받는 순간).
+    const volume =
+      typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : undefined
+    const vol = volume === undefined ? {} : { volume }
     const cover = lobbyImageRef(raw.cover, MAX_LOBBY_COVER)
     if (cover && cover.length <= coverBudget) {
       coverBudget -= cover.length
-      out.push({ title, cover, src })
+      out.push({ title, cover, src, ...vol })
     } else {
-      out.push({ title, src })
+      out.push({ title, src, ...vol })
     }
   }
   return out
@@ -852,7 +900,23 @@ export function createAuthStore(opts?: {
         if (Array.isArray(data.accounts)) accounts = data.accounts
       }
     } catch (e) {
-      console.error('[auth] accounts.json 로드 실패. 빈 목록으로 시작:', e)
+      // 빈 목록으로 시작하면 다음 저장이 깨진 원본을 덮어쓴다 — 손대기 전에 사본을 남겨 되살릴 길을 열어 둔다.
+      let kept = ''
+      try {
+        if (existsSync(accountsPath)) {
+          const t = new Date()
+          const p = (n: number): string => String(n).padStart(2, '0')
+          const stamp = `${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}-${p(t.getHours())}${p(t.getMinutes())}${p(t.getSeconds())}`
+          copyFileSync(accountsPath, `${accountsPath}.bad-${stamp}`)
+          kept = `accounts.json.bad-${stamp}`
+        }
+      } catch {
+        /* 사본조차 못 남기면 원본은 그대로 둔 채 진행 — 아래 로그가 유일한 단서가 된다 */
+      }
+      console.error(
+        `[auth] accounts.json 로드 실패. 빈 목록으로 시작합니다${kept ? ` (원본은 ${kept} 로 보존)` : ''}:`,
+        e
+      )
     }
     try {
       if (existsSync(configPath)) config = JSON.parse(readFileSync(configPath, 'utf8')) as ConfigShape

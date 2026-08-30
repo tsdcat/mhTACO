@@ -35,7 +35,7 @@ import { GLOBAL_MAP_ID, SERVER_VERSION } from './protocol'
 import type { IncomingMessage } from 'node:http'
 import type { Server as HttpsServer } from 'node:https'
 import { createServer as createHttpsServer } from 'node:https'
-import { RoomStore, canViewHandout, canSeeToken, tokenForViewer, tokenVisibility, type Room } from './rooms'
+import { RoomStore, canViewHandout, canSeeToken, tokenForViewer, tokenVisibility, type Room, type CardSpeaker } from './rooms'
 import { parseCommand, resolveInlineRolls, allCardKeywords, diceCardKeywords } from './dice/engine'
 import { createAuthStore, type AuthStore, type PublicAccount } from './auth'
 import { createCharacterStore, type CharacterStore } from './characters'
@@ -214,6 +214,16 @@ function presenceHeadshot(
 }
 
 /**
+ * 비주얼 카드를 고를 때 쓸 화자 — 방금 서버가 각인한 메시지에서 그대로 뽑는다.
+ *
+ * GM 의 1회성 NPC 발화에는 charId 가 없다(npc 표시만 붙는다). 그런 발화는 어떤 화자에도 매이지
+ * 않으므로 공용 카드만 뜬다 — 없는 값을 지어내 아무 화자나 흉내 내게 하지 않는다.
+ */
+function cardSpeakerOf(m: { playerId?: string; charId?: string }): CardSpeaker {
+  return { playerId: m.playerId, charId: m.charId }
+}
+
+/**
  * 비밀 메시지(비밀 굴림·비밀 발화) 수신 대상 개인 룸 — 보낸 사람 + 그 방의 모든 GM.
  * rooms.canSeeMessage(히스토리 열람 규칙)와 같은 집합이어야 한다 — 어긋나면 재입장 뒤에야 보이는 메시지가 생긴다.
  */
@@ -302,6 +312,9 @@ export function createRelay(opts?: {
   dataDir?: string
   /** 웹 클라이언트(웹판) 정적 루트 — build:web 산출물(webdist). 지정 시 미매칭 GET/HEAD 를 실존 파일로 서빙. */
   webRoot?: string | null
+  /** 이번 기동이 빈 데이터 폴더에서 시작했는가(index.ts 의 checkDataDir 결과). 마커를 남긴 뒤의 재기동은
+   *  내용이 없어도 false(used) — /health 의 data 필드로 노출해, 볼륨이 안 붙은 서버를 밖에서 알아볼 수 있게 한다. */
+  dataFresh?: boolean
   /** 진단 로거(주입 시 연결/해제·주기 메모리·소켓 수를 호스트 로그로). 미주입(테스트)이면 무음. */
   log?: (...args: unknown[]) => void
 }): Relay {
@@ -741,11 +754,14 @@ export function createRelay(opts?: {
    */
   const WEB_CSP = [
     "default-src 'self'",
-    "script-src 'self' https://www.youtube.com",
+    // blob: — 확장팩(.tkext)을 이 브라우저에 설치해 쓰는 길. 사람이 고른 파일을 풀어 blob 주소로
+    // 실행한다. eval 을 여는 것(unsafe-eval)과 다르다 — 이미 우리 코드가 돌고 있어야만 만들 수 있는
+    // 주소라, 밖에서 밀어 넣은 글이 코드가 되는 길은 열리지 않는다.
+    "script-src 'self' blob: https://www.youtube.com",
     "style-src 'self' 'unsafe-inline'",
     'img-src * data: blob:',
     'media-src * data: blob:',
-    "font-src 'self' data:",
+    "font-src 'self' data: blob:", // 확장팩이 제 글꼴을 함께 담아 오는 경우
     'connect-src * data: blob:',
     "worker-src 'self' blob:",
     "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com",
@@ -821,8 +837,10 @@ export function createRelay(opts?: {
       return
     }
     if (req.url === '/health') {
+      // data: 'fresh'=이번 기동이 빈 데이터 폴더에서 시작(볼륨 미부착 의심) · 'used'=쓰던 폴더.
+      const data = opts?.dataFresh === true ? 'fresh' : 'used'
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, ver: SERVER_VERSION, rooms: store.roomCount }))
+      res.end(JSON.stringify({ ok: true, ver: SERVER_VERSION, rooms: store.roomCount, data }))
       return
     }
     // 자산 서빙(GET /asset/<sha256>) — 콘텐츠 주소(불변)라 영구 캐시. 해시가 곧 캐퍼빌리티이므로 인증 없이 제공.
@@ -984,6 +1002,16 @@ export function createRelay(opts?: {
         res.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' })
         res.end(JSON.stringify(result))
       })
+      return
+    }
+    // 세션 재개 — 저장해 둔 토큰으로 계정을 되살린다(웹판 새로고침이 재로그인이 되지 않게).
+    // 토큰은 Authorization: Bearer 로만 받는다(주소에 싣지 않는다). 유효하면 로그인과 같은 공개 계정을 준다.
+    if (req.method === 'GET' && req.url === '/auth/me') {
+      const authz = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : ''
+      const token = authz.startsWith('Bearer ') ? authz.slice(7) : ''
+      const account = token ? auth.verifyToken(token) : null
+      res.writeHead(account ? 200 : 401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(account ? { ok: true, account } : { ok: false, error: '로그인이 필요합니다.' }))
       return
     }
     // 프로필 갱신(닉네임·사진·소개) — 토큰 인증. 본문에 token + 부분 패치.
@@ -3889,6 +3917,19 @@ export function createRelay(opts?: {
       ack?.({ ok: true, data: { ok: true } })
     })
 
+    /**
+     * 이 메시지의 화자 — 요청에 charId 가 실려 있으면 본인 몫의 보관대(charPool)에서 그 캐릭터를 찾는다
+     * (창마다 다른 화자로 말하는 길). 장착 슬롯과 같은 캐릭터면 슬롯(최신 표정)을 쓰고, 없거나 못 찾으면
+     * 예전대로 장착 슬롯이다. 보관대 키가 (playerId, charId) 라 남의 캐릭터는 애초에 닿지 않는다.
+     */
+    const speakerFor = (roomId: string, charId: unknown): SharedCharacter | undefined => {
+      const slot = store.getRoom(roomId)?.characters.get(playerId)
+      const want = typeof charId === 'string' && charId ? charId : ''
+      if (!want) return slot
+      if (slot && slot.charId === want) return slot
+      return store.pooledCharacter(roomId, playerId, want) ?? slot
+    }
+
     on('chat:send', (req) => {
       const roomId = socket.data.roomId
       if (!roomId || !req) return
@@ -3917,19 +3958,23 @@ export function createRelay(opts?: {
         sender.role === 'GM' && typeof req.npcName === 'string' ? req.npcName.trim().slice(0, 60) : ''
       const isNpc = npcName.length > 0
       // author/color 는 현재 발화 정체성(프레즌스 = 오너 또는 장착 캐릭터)을 우선 반영, 없으면 참가자 폴백.
-      // (정체성 전환 시 클라가 char:update 를 먼저 보내므로 소켓 순서상 최신 정체성이 반영됨.)
-      const identity = isNpc ? undefined : room.characters.get(playerId)
+      // 요청에 charId 가 실려 있으면 보관대에서 그 캐릭터를 화자로 쓴다(창마다 다른 화자).
+      const identity = isNpc ? undefined : speakerFor(roomId, req.charId)
       const author = isNpc ? npcName : identity?.name || sender.nick
       const color = isNpc ? '#8b93a7' : identity?.color || sender.color
       // 발화 당시 두상·이름색을 메시지에 각인 — 영속·재시작·새 참가자에도 채팅 두상 보존. NPC 는 투명 두상이라 미설정.
-      const avatar = isNpc ? undefined : presenceHeadshot(identity)
+      // 두상이 없으면 빈 문자열('')을 각인한다 — '없음'을 확정해 두지 않으면 클라가 렌더 때마다 현재 상태를
+      // 재조회해, 나중에 인장을 넣거나 화자를 바꾸는 순간 과거 메시지의 두상이 소급해 바뀐다.
+      const avatar = isNpc ? undefined : (presenceHeadshot(identity) ?? '')
       const nameColor = isNpc ? undefined : identity?.nameColor
+      const speakerCharId = isNpc ? undefined : identity?.charId || undefined
       const base = {
         id,
         time,
         channel,
         author,
         playerId,
+        ...(speakerCharId ? { charId: speakerCharId } : {}),
         color,
         avatar,
         nameColor,
@@ -3980,20 +4025,22 @@ export function createRelay(opts?: {
       // 주사위는 결과 라벨(성공/실패/단계)이 카드 이름과 정확히 일치하면 전원 오버레이 재생.
       // 한 발화에 컷인 1개(포함 매칭은 긴 이름 우선). 발화 순간 1회만 emit 하므로 히스토리 재생·재입장에는
       // 다시 뜨지 않는다(클라 오버레이도 nonce 로 과거 트리거를 무시).
+      // 화자는 서버가 방금 각인한 값을 그대로 넘긴다 — 카드에 화자를 매어 두었으면 그 사람이 말할 때만 뜬다.
+      const speaker = cardSpeakerOf(message)
       if ('text' in message && message.text) {
-        const card = store.findCardInText(roomId, message.text)
+        const card = store.findCardInText(roomId, message.text, speaker)
         if (card) io.to(roomId).emit('room:cardplay', { card })
       } else if (message.kind === 'dice' && message.dice) {
         // 라벨 굴림(예: "CC<=60 (근력)")은 기능명이 카드 이름과 겹칠 수 있어 원문 포함 매칭을
         // 우선한다 — 평문 발화의 카드 트리거와 동일 규칙. 무라벨 명령은 결과 라벨 키워드만 본다.
         const named =
           'name' in message.dice && message.dice.name
-            ? store.findCardInText(roomId, message.dice.command)
+            ? store.findCardInText(roomId, message.dice.command, speaker)
             : undefined
         if (named) {
           io.to(roomId).emit('room:cardplay', { card: named })
         } else {
-          const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords())
+          const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords(), speaker)
           if (card) io.to(roomId).emit('room:cardplay', { card })
         }
       }
@@ -4020,14 +4067,17 @@ export function createRelay(opts?: {
       const time = Date.now()
       const channel = req.channel ?? 'main'
       const secret = req.secret === true
-      const identity = room.characters.get(playerId)
+      // 시트 굴림은 그 시트의 캐릭터(charId)가 화자다 — 장착과 무관하게 굴린 시트대로 각인된다.
+      const identity = speakerFor(roomId, req.charId)
       const author = identity?.name || sender.nick
       const color = identity?.color || sender.color
-      const avatar = presenceHeadshot(identity) // 발화 당시 두상 각인
+      const avatar = presenceHeadshot(identity) ?? '' // 발화 당시 두상 각인('' = 인장 없음 확정)
       const nameColor = identity?.nameColor
+      const speakerCharId = identity?.charId || undefined
+      const stamp = { id, time, channel, author, playerId, ...(speakerCharId ? { charId: speakerCharId } : {}), color, avatar, nameColor }
       const message: ChatMessage = dice
-        ? { id, time, channel, author, playerId, color, avatar, nameColor, kind: 'dice', dice }
-        : { id, time, channel, author, playerId, color, avatar, nameColor, kind: 'madness', madness }
+        ? { ...stamp, kind: 'dice', dice }
+        : { ...stamp, kind: 'madness', madness }
 
       // 라우팅(chat:send 와 동일): 비밀=GM+본인, 귓속말=대상+본인, 그 외 공개=방 전체. 전부 히스토리 저장.
       if (secret) {
@@ -4059,7 +4109,9 @@ export function createRelay(opts?: {
       // 시트 굴림도 결과 라벨(성공/실패/단계)로 비주얼 카드 발동 — 공개 굴림만, 광기(madness)는 라벨 없음.
       if (message.kind === 'dice' && message.dice) {
         // 시트·팔레트에서 굴린 것도 채팅에 직접 친 판정과 같은 규칙으로 카드를 찾는다.
-        const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords())
+        // ⚠ 화자를 여기에도 넘겨야 한다. 한 곳만 넘기면 '채팅으로 친 판정은 화자별로 뜨는데
+        //    시트에서 굴린 판정은 전원에게 뜨는' 어긋남이 남는다.
+        const card = store.findCardForResult(roomId, diceCardKeywords(message.dice), allCardKeywords(), cardSpeakerOf(message))
         if (card) io.to(roomId).emit('room:cardplay', { card })
       }
     })
@@ -4124,28 +4176,41 @@ export function createRelay(opts?: {
       // 무슨 수치가 변한 건지 사라지므로, 이름이 긴 경우까지 담을 만큼 넉넉히 둔다.
       const label = req.label.trim().slice(0, 60)
       if (!label) return
-      const identity = room.characters.get(playerId)
+      // 굴림 유래 줄은 그 굴림과 같은 탭으로 — 그룹(비밀 HO) 탭에서 굴렸으면 차감 안내도 그 탭에만.
+      // 그룹은 발신 권한을 검증하고, 통과 못 하면 예전대로 메인에 남긴다(안내가 통째로 사라지는 것 방지).
+      const groupId =
+        req.channel === 'group' &&
+        typeof req.groupId === 'string' &&
+        req.groupId &&
+        store.canAccessChannel(roomId, req.groupId, playerId)
+          ? req.groupId
+          : undefined
+      const channel = req.channel === 'ooc' ? 'ooc' : groupId ? 'group' : 'main'
+      const identity = speakerFor(roomId, req.charId)
       const diff = to - from
       const message: ChatMessage = {
         id: randomUUID(),
         time: Date.now(),
-        channel: req.channel === 'ooc' ? 'ooc' : 'main',
+        channel,
+        ...(groupId ? { groupId } : {}),
         kind: 'stat',
         author: identity?.name || sender.nick,
         playerId,
+        ...(identity?.charId ? { charId: identity.charId } : {}),
         color: identity?.color || sender.color,
-        avatar: presenceHeadshot(identity),
+        avatar: presenceHeadshot(identity) ?? '', // '' = 인장 없음 확정(소급 재해석 방지)
         nameColor: identity?.nameColor,
         stat: { label, from, to, max: max !== null && max > 0 ? max : undefined },
-        // GM 이 남기는 상태 변화는 GM 에게만 보인다 — GM 이 든 NPC·적 시트의 체력이 방 전체에
-        // 실시간으로 새어 나가면 진행이 무너진다. 알리고 싶은 수치는 GM 이 직접 말하면 된다.
-        secret: sender.role === 'GM' || undefined,
+        // GM 이 남기는 상태 변화는 기본 GM 에게만 보인다 — GM 이 든 NPC·적 시트의 체력이 방 전체에
+        // 실시간으로 새어 나가면 진행이 무너진다. 다만 '공개 굴림에서 유래한' 줄(open)은 판정 카드가
+        // 이미 손실량까지 공개했으므로 함께 공개한다. 발신자가 비밀 굴림 중이면(secret) 누구든 비밀로.
+        secret: (req.secret === true || (sender.role === 'GM' && req.open !== true)) || undefined,
         // 이 종류를 모르는 구버전 프로그램에서도 읽히게 평문을 함께 싣는다(빈 줄로 뜨는 것 방지).
         // 덤으로 채팅 검색에도 걸린다(검색은 text 만 본다).
         text: `${label} ${from} → ${to} (${diff > 0 ? '+' : ''}${diff})`
       }
       store.addMessage(roomId, message)
-      // 비밀이면 당사자·GM 개인 룸으로만(히스토리 필터 canSeeMessage 와 같은 집합).
+      // 비밀·그룹이면 당사자·GM·멤버 개인 룸으로만(히스토리 필터 canSeeMessage 와 같은 집합).
       for (const target of messageAudience(room, message)) io.to(target).emit('chat:new', message)
     })
 
@@ -4410,6 +4475,22 @@ export function createRelay(opts?: {
       if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시 (위조 방지)
       const stored = store.mergeIdentity(roomId, coerceIdentity(req))
       if (stored) io.to(roomId).emit('char:state', stored)
+    })
+
+    // 장착 슬롯은 그대로 두고 보관대(charPool)에만 담는다 — 분리 창이 제 화자를 등록하는 길.
+    // 장착(char:update)로 담으면 무대·로스터까지 그 캐릭터로 갈아타 창끼리 서로를 밀어낸다.
+    // 방송도 char:pool 로 — 수신 클라는 보관대만 갱신한다(chat:new 의 charId 동결이 이 사본을 본다).
+    on('char:pool', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req) return
+      const room = store.getRoom(roomId)
+      if (!room || !room.participants.has(playerId)) return // 방 밖 소켓 무시 (위조 방지)
+      const stored = store.poolCharacter(roomId, {
+        ...coerceIdentity(req),
+        standings: Array.isArray(req.standings) ? req.standings.filter((s) => typeof s === 'string') : [],
+        currentExpression: typeof req.currentExpression === 'number' ? req.currentExpression : 0
+      })
+      if (stored) io.to(roomId).emit('char:pool', stored)
     })
 
     on('char:expr', (req) => {
@@ -4712,6 +4793,27 @@ export function createRelay(opts?: {
       emitHandoutFocus(targets, h.id)
     })
 
+    on('handout:reorder', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      if (!room) return
+      const me = room.participants.get(playerId)
+      if (!me || me.role !== 'GM') return // 재배치도 upsert 와 같은 GM 전용
+      const changed = store.reorderHandout(
+        roomId,
+        req.id,
+        typeof req.beforeId === 'string' ? req.beforeId : undefined
+      )
+      if (!changed) return
+      // 순서만 바뀌었으니 가시성 diff 는 없다 — 바뀐 각 건을 볼 수 있는 사람에게 그대로 재방송.
+      const all = [...room.participants.values()]
+      for (const h of changed) {
+        const view = all.filter((p) => canViewHandout(h, p)).map((p) => p.playerId)
+        emitHandoutState(view, h)
+      }
+    })
+
     // ===== 맵·토큰 (다중 맵) =====
     // GM 검증: 방에 속한 GM 이면 roomId, 아니면 undefined.
     const gmRoomId = (): string | undefined => {
@@ -4921,6 +5023,14 @@ export function createRelay(opts?: {
       if (!roomId || !req) return
       const res = store.setVnOverlay(roomId, req.enabled === true)
       if (res.ok) io.to(roomId).emit('room:vnoverlay', { enabled: res.enabled })
+    })
+
+    // 참가자 오브젝트 추가 허용(GM 전용) — 전원 동기화. 켜면 참가자도 token:place:pl 로 배치할 수 있다.
+    on('room:plobjects', (req) => {
+      const roomId = gmRoomId()
+      if (!roomId || !req) return
+      const res = store.setPlObjects(roomId, req.enabled === true)
+      if (res.ok) io.to(roomId).emit('room:plobjects', { enabled: res.enabled })
     })
 
     // GM 귓속말 열람(GM 전용) — 전원 동기화. 참가자 모두에게 알리는 것은 숨기지 않기 위해서다.
@@ -5310,6 +5420,19 @@ export function createRelay(opts?: {
       if (token && room) broadcastTokenState(room, roomId, req.mapId, token)
     })
 
+    // 참가자 오브젝트 배치 — 방 설정(plObjects) 켬일 때만. 필드 화이트리스트·소유자 검증·상한은 placePlToken 이
+    // 담당하고(신규엔 ownerPlayerId 스탬프), 이미지 캡은 GM 경로와 같은 upsertToken 병합을 그대로 지난다.
+    on('token:place:pl', (req) => {
+      const roomId = socket.data.roomId
+      if (!roomId || !req || typeof req.mapId !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      if (room.plObjects !== true) return // 방 설정 꺼짐 — 조용히 무시(구클라·꺼진 뒤 늦게 온 요청)
+      const token = store.placePlToken(roomId, req.mapId, playerId, req)
+      if (token) broadcastTokenState(room, roomId, req.mapId, token)
+    })
+
     on('token:move', (req) => {
       const roomId = socket.data.roomId
       if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
@@ -5320,8 +5443,13 @@ export function createRelay(opts?: {
       if (!me) return
       const token = store.getToken(roomId, req.mapId, req.id)
       if (!token) return
-      // 이동 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰 또는 권한을 부여받은 토큰(allowedPlayers).
-      if (me.role !== 'GM' && token.charPlayerId !== playerId && !token.allowedPlayers?.includes(playerId))
+      // 이동 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
         return
       const moved = store.moveToken(roomId, req.mapId, req.id, req.x, req.y)
       if (moved) {
@@ -5342,8 +5470,13 @@ export function createRelay(opts?: {
       if (!me) return
       const token = store.getToken(roomId, req.mapId, req.id)
       if (!token) return
-      // 회전 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰 또는 권한을 부여받은 토큰(allowedPlayers).
-      if (me.role !== 'GM' && token.charPlayerId !== playerId && !token.allowedPlayers?.includes(playerId))
+      // 회전 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
         return
       const rotated = store.rotateToken(roomId, req.mapId, req.id, req.rotation)
       if (rotated) {
@@ -5366,8 +5499,13 @@ export function createRelay(opts?: {
       if (!me) return
       const token = store.getToken(roomId, req.mapId, req.id)
       if (!token) return
-      // 크기조정 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰 또는 권한을 부여받은 토큰(allowedPlayers).
-      if (me.role !== 'GM' && token.charPlayerId !== playerId && !token.allowedPlayers?.includes(playerId))
+      // 크기조정 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
         return
       const resized = store.resizeToken(roomId, req.mapId, req.id, req.size)
       if (resized) {
@@ -5390,8 +5528,13 @@ export function createRelay(opts?: {
       if (!me) return
       const token = store.getToken(roomId, req.mapId, req.id)
       if (!token) return
-      // 전환 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰 또는 권한을 부여받은 토큰(allowedPlayers).
-      if (me.role !== 'GM' && token.charPlayerId !== playerId && !token.allowedPlayers?.includes(playerId))
+      // 전환 권한: GM 은 모든 토큰, PL 은 자기 캐릭터 토큰·권한 부여 토큰(allowedPlayers)·자기가 올린 오브젝트.
+      if (
+        me.role !== 'GM' &&
+        token.charPlayerId !== playerId &&
+        !token.allowedPlayers?.includes(playerId) &&
+        token.ownerPlayerId !== playerId
+      )
         return
       const t = store.setTokenImageIndex(roomId, req.mapId, req.id, req.index)
       if (t) {
@@ -5401,9 +5544,16 @@ export function createRelay(opts?: {
       }
     })
 
+    // 토큰 삭제 — GM 은 모든 토큰, PL 은 자기가 올린 오브젝트만(map:text:remove 와 같은 규칙).
     on('token:remove', (req) => {
-      const roomId = gmRoomId()
+      const roomId = socket.data.roomId
       if (!roomId || !req || typeof req.mapId !== 'string' || typeof req.id !== 'string') return
+      const room = store.getRoom(roomId)
+      const me = room?.participants.get(playerId)
+      if (!room || !me) return
+      const token = store.getToken(roomId, req.mapId, req.id)
+      if (!token) return
+      if (me.role !== 'GM' && token.ownerPlayerId !== playerId) return
       const prev = store.removeToken(roomId, req.mapId, req.id)
       if (prev) io.to(roomId).emit('token:remove', { mapId: req.mapId, id: prev.id })
     })

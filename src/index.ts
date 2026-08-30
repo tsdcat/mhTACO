@@ -164,6 +164,8 @@ const { httpServer, listAvatarRefs } = createRelay({
   // ⚠ 릴레이도 같은 폴더를 봐야 한다 — 관리 화면의 서버 데이터 내보내기/가져오기가 이 값으로 폴더를 훑는다.
   //   여기만 빠지면 볼륨을 다른 곳에 붙인 서버에서 '빈 백업'이 성공한 것처럼 내려간다.
   dataDir,
+  // /health 의 data 필드('fresh'/'used') — 볼륨이 안 붙어 매 배포 새 폴더로 시작하는 서버를 밖에서 알아보게.
+  dataFresh: dataState.fresh,
   auth: authStore,
   characters: charStore,
   rooms: roomStore,

@@ -554,6 +554,8 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
       // 수정 권한(내 글인지·남의 글도 되는지)은 라우트가 판정한다. 여기서는 작성자 정보를 덮어쓰지 않는 것만 지킨다.
       let doc = input.postId ? loadDoc(input.postId) : null
       if (input.postId && !doc) return { ok: false, error: '글을 찾을 수 없습니다.' }
+      // 임시저장이었다가 이번 저장으로 발행되는지 — 아래에서 draft 를 덮어쓰기 전에 봐 둔다.
+      const wasDraft = doc ? doc.post.draft : false
       if (!doc) {
         const b = idx(boardId)
         if (b.summaries.filter((s) => !s.deletedAt).length >= MAX_POSTS_PER_BOARD) {
@@ -657,6 +659,9 @@ export function createCommunityPostStore(opts?: { dataDir?: string; persist?: bo
         if (!post.tags.length) post.tags = strList(tagCell(post.fields[tagsKey]), MAX_TAG, MAX_TAGS)
         delete post.fields[tagsKey]
       }
+      // 발행되는 순간이 글이 처음 목록에 서는 때다 — 담아 둔 시각이 남으면 목록·정렬이 전부
+      // createdAt 기준이라 새로 낸 글이 옛 날짜 자리로 밀려난다. 발행 글의 일반 재저장은 그대로.
+      if (wasDraft && !post.draft) post.createdAt = now
       post.updatedAt = now
       if (!doc) {
         doc = { post, comments: [], dirty: true, usedAt: Date.now() }
